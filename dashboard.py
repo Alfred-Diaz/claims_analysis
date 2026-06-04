@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import traceback
 
 import pandas as pd
 import streamlit as st
@@ -22,7 +23,14 @@ st.title("Claims Analysis Dashboard")
 st.caption("Analyze ERP exports, review exceptions, and search historical batch results.")
 
 DB_PATH = "data/claims_analysis.db"
-initialize_database(DB_PATH)
+PREVIEW_ROWS = 1000
+
+try:
+    initialize_database(DB_PATH)
+except Exception as exc:
+    st.error("Database initialization failed.")
+    st.exception(exc)
+    st.stop()
 
 
 def read_report(run_dir: Path, filename: str) -> pd.DataFrame:
@@ -30,6 +38,15 @@ def read_report(run_dir: Path, filename: str) -> pd.DataFrame:
     if path.exists():
         return pd.read_csv(path)
     return pd.DataFrame()
+
+
+def show_preview(df: pd.DataFrame, label: str) -> None:
+    if df.empty:
+        st.info(f"No {label} records found.")
+        return
+
+    st.caption(f"Showing first {min(len(df), PREVIEW_ROWS):,} of {len(df):,} rows.")
+    st.dataframe(df.head(PREVIEW_ROWS), use_container_width=True)
 
 
 def show_kpis(summary_df: pd.DataFrame) -> None:
@@ -55,6 +72,10 @@ tab_analyze, tab_latest, tab_search = st.tabs(["Run Analysis", "Latest Reports",
 
 with tab_analyze:
     st.subheader("Upload ERP Exports")
+    st.warning(
+        "For very large files, the app may take several minutes. "
+        "Do not display full datasets on-screen; only previews are shown."
+    )
 
     claims_file = st.file_uploader("Claims Process CSV", type=["csv"])
     checks_file = st.file_uploader("Check Date Created CSV", type=["csv"])
@@ -63,11 +84,17 @@ with tab_analyze:
     amount_column = col_a.text_input("Amount Column", value="amount")
     fuzzy_threshold = col_b.slider("Payee Match Threshold", min_value=0, max_value=100, value=80)
 
+    if claims_file:
+        st.caption(f"Claims Process file size: {claims_file.size / (1024 * 1024):,.2f} MB")
+    if checks_file:
+        st.caption(f"Check Date Created file size: {checks_file.size / (1024 * 1024):,.2f} MB")
+
     if st.button("Run Claims Analysis", type="primary"):
         if not claims_file or not checks_file:
             st.error("Please upload both CSV files.")
         else:
-            with st.spinner("Running analysis..."):
+            try:
+                progress = st.progress(0, text="Saving uploaded files...")
                 with tempfile.TemporaryDirectory() as tmpdir:
                     tmp = Path(tmpdir)
                     claims_path = tmp / claims_file.name
@@ -75,6 +102,7 @@ with tab_analyze:
                     claims_path.write_bytes(claims_file.getvalue())
                     checks_path.write_bytes(checks_file.getvalue())
 
+                    progress.progress(20, text="Running claims analysis...")
                     config = AnalysisConfig(
                         amount_column=amount_column,
                         fuzzy_threshold=fuzzy_threshold,
@@ -85,29 +113,37 @@ with tab_analyze:
                         output_root="reports/history",
                         config=config,
                     )
+
+                    progress.progress(80, text="Saving results to database...")
                     run_id = save_run_to_database(
                         run_dir=run_dir,
                         claims_file=claims_file.name,
                         checks_file=checks_file.name,
                         db_path=DB_PATH,
                     )
+                    progress.progress(100, text="Complete.")
 
-            st.success(f"Analysis completed. Database run ID: {run_id}")
-            st.info(f"Reports saved to: {run_dir}")
+                st.success(f"Analysis completed. Database run ID: {run_id}")
+                st.info(f"Reports saved to: {run_dir}")
 
-            summary_df = read_report(run_dir, "summary.csv")
-            results_df = read_report(run_dir, "claims_analysis_output.csv")
-            show_kpis(summary_df)
-            st.dataframe(results_df, use_container_width=True)
+                summary_df = read_report(run_dir, "summary.csv")
+                results_df = read_report(run_dir, "claims_analysis_output.csv")
+                show_kpis(summary_df)
+                show_preview(results_df, "result")
 
-            excel_path = run_dir / "summary_report.xlsx"
-            if excel_path.exists():
-                st.download_button(
-                    "Download Excel Report",
-                    data=excel_path.read_bytes(),
-                    file_name="summary_report.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                excel_path = run_dir / "summary_report.xlsx"
+                if excel_path.exists():
+                    st.download_button(
+                        "Download Excel Report",
+                        data=excel_path.read_bytes(),
+                        file_name="summary_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+            except Exception as exc:
+                st.error("Analysis failed. See details below.")
+                st.exception(exc)
+                with st.expander("Full traceback"):
+                    st.code(traceback.format_exc())
 
 with tab_latest:
     st.subheader("Latest Reports")
@@ -129,15 +165,15 @@ with tab_latest:
             ["Results", "For Review", "Unmatched", "Duplicate Checks", "Duplicate CV"]
         )
         with report_tab1:
-            st.dataframe(results_df, use_container_width=True)
+            show_preview(results_df, "result")
         with report_tab2:
-            st.dataframe(for_review_df, use_container_width=True)
+            show_preview(for_review_df, "for review")
         with report_tab3:
-            st.dataframe(unmatched_df, use_container_width=True)
+            show_preview(unmatched_df, "unmatched batch")
         with report_tab4:
-            st.dataframe(duplicate_checks_df, use_container_width=True)
+            show_preview(duplicate_checks_df, "duplicate check")
         with report_tab5:
-            st.dataframe(duplicate_cv_df, use_container_width=True)
+            show_preview(duplicate_cv_df, "duplicate CV")
 
         excel_path = latest_dir / "summary_report.xlsx"
         if excel_path.exists():
@@ -156,8 +192,12 @@ with tab_search:
         if not batch_no.strip():
             st.warning("Enter a batch number to search.")
         else:
-            results = search_batch(batch_no.strip(), db_path=DB_PATH)
-            if results.empty:
-                st.info("No historical records found for this batch.")
-            else:
-                st.dataframe(results, use_container_width=True)
+            try:
+                results = search_batch(batch_no.strip(), db_path=DB_PATH)
+                if results.empty:
+                    st.info("No historical records found for this batch.")
+                else:
+                    show_preview(results, "historical batch")
+            except Exception as exc:
+                st.error("Search failed.")
+                st.exception(exc)
