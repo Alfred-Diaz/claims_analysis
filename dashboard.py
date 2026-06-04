@@ -1,0 +1,163 @@
+"""Streamlit dashboard for Claims Analysis.
+
+Run locally:
+    streamlit run dashboard.py
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import tempfile
+
+import pandas as pd
+import streamlit as st
+
+from claims_analysis.analyzer import AnalysisConfig, run_analysis
+from claims_analysis.database import initialize_database, save_run_to_database, search_batch
+
+
+st.set_page_config(page_title="Claims Analysis", layout="wide")
+
+st.title("Claims Analysis Dashboard")
+st.caption("Analyze ERP exports, review exceptions, and search historical batch results.")
+
+DB_PATH = "data/claims_analysis.db"
+initialize_database(DB_PATH)
+
+
+def read_report(run_dir: Path, filename: str) -> pd.DataFrame:
+    path = run_dir / filename
+    if path.exists():
+        return pd.read_csv(path)
+    return pd.DataFrame()
+
+
+def show_kpis(summary_df: pd.DataFrame) -> None:
+    if summary_df.empty:
+        st.info("No summary available yet.")
+        return
+
+    summary = dict(zip(summary_df["metric"], summary_df["value"]))
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Batches", summary.get("total_batches", 0))
+    col2.metric("Total Amount", summary.get("total_amount", 0))
+    col3.metric("For Review", summary.get("for_review_payees", 0))
+    col4.metric("Unmatched", summary.get("unmatched_batches", 0))
+
+    col5, col6, col7, col8 = st.columns(4)
+    col5.metric("Hospital", summary.get("hospital_count", 0))
+    col6.metric("Professional", summary.get("professional_count", 0))
+    col7.metric("Duplicate Checks", summary.get("duplicate_check_numbers", 0))
+    col8.metric("Duplicate CV", summary.get("duplicate_cv_numbers", 0))
+
+
+tab_analyze, tab_latest, tab_search = st.tabs(["Run Analysis", "Latest Reports", "Search History"])
+
+with tab_analyze:
+    st.subheader("Upload ERP Exports")
+
+    claims_file = st.file_uploader("Claims Process CSV", type=["csv"])
+    checks_file = st.file_uploader("Check Date Created CSV", type=["csv"])
+
+    col_a, col_b = st.columns(2)
+    amount_column = col_a.text_input("Amount Column", value="amount")
+    fuzzy_threshold = col_b.slider("Payee Match Threshold", min_value=0, max_value=100, value=80)
+
+    if st.button("Run Claims Analysis", type="primary"):
+        if not claims_file or not checks_file:
+            st.error("Please upload both CSV files.")
+        else:
+            with st.spinner("Running analysis..."):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp = Path(tmpdir)
+                    claims_path = tmp / claims_file.name
+                    checks_path = tmp / checks_file.name
+                    claims_path.write_bytes(claims_file.getvalue())
+                    checks_path.write_bytes(checks_file.getvalue())
+
+                    config = AnalysisConfig(
+                        amount_column=amount_column,
+                        fuzzy_threshold=fuzzy_threshold,
+                    )
+                    run_dir = run_analysis(
+                        claims_path=claims_path,
+                        checks_path=checks_path,
+                        output_root="reports/history",
+                        config=config,
+                    )
+                    run_id = save_run_to_database(
+                        run_dir=run_dir,
+                        claims_file=claims_file.name,
+                        checks_file=checks_file.name,
+                        db_path=DB_PATH,
+                    )
+
+            st.success(f"Analysis completed. Database run ID: {run_id}")
+            st.info(f"Reports saved to: {run_dir}")
+
+            summary_df = read_report(run_dir, "summary.csv")
+            results_df = read_report(run_dir, "claims_analysis_output.csv")
+            show_kpis(summary_df)
+            st.dataframe(results_df, use_container_width=True)
+
+            excel_path = run_dir / "summary_report.xlsx"
+            if excel_path.exists():
+                st.download_button(
+                    "Download Excel Report",
+                    data=excel_path.read_bytes(),
+                    file_name="summary_report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+with tab_latest:
+    st.subheader("Latest Reports")
+    latest_dir = Path("reports/latest")
+
+    if not latest_dir.exists():
+        st.info("No latest reports found yet. Run an analysis first.")
+    else:
+        summary_df = read_report(latest_dir, "summary.csv")
+        results_df = read_report(latest_dir, "claims_analysis_output.csv")
+        for_review_df = read_report(latest_dir, "for_review.csv")
+        unmatched_df = read_report(latest_dir, "unmatched_batches.csv")
+        duplicate_checks_df = read_report(latest_dir, "duplicate_checks.csv")
+        duplicate_cv_df = read_report(latest_dir, "duplicate_cv.csv")
+
+        show_kpis(summary_df)
+
+        report_tab1, report_tab2, report_tab3, report_tab4, report_tab5 = st.tabs(
+            ["Results", "For Review", "Unmatched", "Duplicate Checks", "Duplicate CV"]
+        )
+        with report_tab1:
+            st.dataframe(results_df, use_container_width=True)
+        with report_tab2:
+            st.dataframe(for_review_df, use_container_width=True)
+        with report_tab3:
+            st.dataframe(unmatched_df, use_container_width=True)
+        with report_tab4:
+            st.dataframe(duplicate_checks_df, use_container_width=True)
+        with report_tab5:
+            st.dataframe(duplicate_cv_df, use_container_width=True)
+
+        excel_path = latest_dir / "summary_report.xlsx"
+        if excel_path.exists():
+            st.download_button(
+                "Download Latest Excel Report",
+                data=excel_path.read_bytes(),
+                file_name="latest_summary_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+with tab_search:
+    st.subheader("Search Batch History")
+    batch_no = st.text_input("Batch No")
+
+    if st.button("Search Batch"):
+        if not batch_no.strip():
+            st.warning("Enter a batch number to search.")
+        else:
+            results = search_batch(batch_no.strip(), db_path=DB_PATH)
+            if results.empty:
+                st.info("No historical records found for this batch.")
+            else:
+                st.dataframe(results, use_container_width=True)
