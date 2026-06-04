@@ -17,8 +17,8 @@ from __future__ import annotations
 from pathlib import Path
 from datetime import datetime
 import logging
+import shutil
 import sqlite3
-import re
 
 import pandas as pd
 from rapidfuzz import fuzz
@@ -151,13 +151,7 @@ def initialize_staging(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def stage_claims(
-    conn: sqlite3.Connection,
-    claims_path: Path,
-    amount_column: str,
-    chunksize: int,
-    logger: logging.Logger,
-) -> int:
+def stage_claims(conn: sqlite3.Connection, claims_path: Path, amount_column: str, chunksize: int, logger: logging.Logger) -> int:
     total_rows = 0
     for idx, chunk in enumerate(pd.read_csv(claims_path, dtype=str, chunksize=chunksize), start=1):
         chunk = normalize_columns(chunk)
@@ -176,12 +170,7 @@ def stage_claims(
     return total_rows
 
 
-def stage_checks(
-    conn: sqlite3.Connection,
-    checks_path: Path,
-    chunksize: int,
-    logger: logging.Logger,
-) -> int:
+def stage_checks(conn: sqlite3.Connection, checks_path: Path, chunksize: int, logger: logging.Logger) -> int:
     total_rows = 0
     for idx, chunk in enumerate(pd.read_csv(checks_path, dtype=str, chunksize=chunksize), start=1):
         chunk = normalize_columns(chunk)
@@ -201,12 +190,7 @@ def stage_checks(
     return total_rows
 
 
-def aggregate_to_reports(
-    conn: sqlite3.Connection,
-    run_dir: Path,
-    fuzzy_threshold: int,
-    logger: logging.Logger,
-) -> None:
+def aggregate_to_reports(conn: sqlite3.Connection, run_dir: Path, fuzzy_threshold: int, logger: logging.Logger) -> None:
     logger.info("Aggregating claims by batch_no")
     conn.executescript(
         """
@@ -357,6 +341,18 @@ def aggregate_to_reports(
         duplicate_cv.head(100000).to_excel(writer, sheet_name="Duplicate CV", index=False)
 
 
+def refresh_latest_reports(run_dir: Path, latest_dir: str | Path = "reports/latest") -> Path:
+    latest_path = Path(latest_dir)
+    latest_path.mkdir(parents=True, exist_ok=True)
+    for existing in latest_path.iterdir():
+        if existing.is_file():
+            existing.unlink()
+    for file_path in run_dir.iterdir():
+        if file_path.is_file():
+            shutil.copy2(file_path, latest_path / file_path.name)
+    return latest_path
+
+
 def run_large_analysis(
     claims_path: str | Path,
     checks_path: str | Path,
@@ -398,6 +394,8 @@ def run_large_analysis(
         logger.info("Total staged check rows: %s", checks_rows)
         aggregate_to_reports(conn, run_dir, fuzzy_threshold, logger)
 
+    latest_path = refresh_latest_reports(run_dir)
+    logger.info("Latest reports refreshed: %s", latest_path)
     logger.info("Large Claims Analysis run completed")
     logger.info("Report folder: %s", run_dir)
     return run_dir
