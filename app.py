@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 
 from claims_analysis.analyzer import AnalysisConfig, run_analysis
-from claims_analysis.large_engine import run_large_analysis
+from claims_analysis.large_reconciliation_engine import run_large_reconciliation
 
 
 def main() -> None:
@@ -14,14 +14,16 @@ def main() -> None:
     parser.add_argument("--check-amount-col", default="check_amount", help="Amount column in Check Date Created export")
     parser.add_argument("--fuzzy-threshold", type=int, default=80, help="Payee fuzzy match threshold")
     parser.add_argument("--output-root", default="reports/history", help="Folder for timestamped reports")
-    parser.add_argument("--large", action="store_true", help="Use large dataset SQLite processing mode")
+    parser.add_argument("--large", action="store_true", help="Use large reconciliation processing mode")
     parser.add_argument("--chunksize", type=int, default=100000, help="Rows per chunk in large mode")
     parser.add_argument("--staging-db", default="data/large_staging.db", help="SQLite staging database path")
+    parser.add_argument("--hospital-wht-rate", type=float, default=0.02, help="Hospital withholding tax rate")
+    parser.add_argument("--tolerance", type=float, default=0.01, help="Allowed amount variance")
 
     args = parser.parse_args()
 
     if args.large:
-        run_dir = run_large_analysis(
+        run_dir = run_large_reconciliation(
             claims_path=args.claims,
             checks_path=args.checks,
             output_root=args.output_root,
@@ -30,6 +32,8 @@ def main() -> None:
             check_amount_column=args.check_amount_col,
             fuzzy_threshold=args.fuzzy_threshold,
             chunksize=args.chunksize,
+            hospital_withholding_rate=args.hospital_wht_rate,
+            tolerance=args.tolerance,
         )
     else:
         config = AnalysisConfig(
