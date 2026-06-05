@@ -26,10 +26,41 @@ def _payment_status(row: pd.Series) -> str:
     return "UNPAID"
 
 
+def _load_claim_documentation_types(claims_path: str | Path | None) -> pd.DataFrame:
+    if not claims_path:
+        return pd.DataFrame(columns=["batch_no", "claim_documentation_type"])
+    path = Path(claims_path)
+    if not path.exists():
+        return pd.DataFrame(columns=["batch_no", "claim_documentation_type"])
+
+    header = pd.read_csv(path, nrows=0)
+    normalized_cols = {str(col).strip().lower().replace(" ", "_"): col for col in header.columns}
+    if "batch_no" not in normalized_cols or "claim_documentation_type" not in normalized_cols:
+        return pd.DataFrame(columns=["batch_no", "claim_documentation_type"])
+
+    usecols = [normalized_cols["batch_no"], normalized_cols["claim_documentation_type"]]
+    parts: list[pd.DataFrame] = []
+    for chunk in pd.read_csv(path, dtype=str, usecols=usecols, chunksize=100000):
+        chunk.columns = [str(col).strip().lower().replace(" ", "_") for col in chunk.columns]
+        part = chunk[["batch_no", "claim_documentation_type"]].fillna("")
+        part["batch_no"] = part["batch_no"].astype(str).str.strip()
+        part["claim_documentation_type"] = part["claim_documentation_type"].astype(str).str.upper().str.strip()
+        parts.append(part)
+
+    if not parts:
+        return pd.DataFrame(columns=["batch_no", "claim_documentation_type"])
+
+    doc_types = pd.concat(parts, ignore_index=True)
+    doc_types = doc_types[doc_types["batch_no"] != ""]
+    doc_types = doc_types.drop_duplicates(subset=["batch_no"], keep="first")
+    return doc_types
+
+
 def enhance_reports(
     reports_dir: str | Path = "reports/latest",
     withholding_rate: float = 0.02,
     tolerance: float = 0.01,
+    claims_path: str | Path | None = "data/raw/CLAIMS PROCESS-FINAL.csv",
 ) -> Path:
     reports_path = Path(reports_dir)
     results_path = reports_path / "claims_analysis_output.csv"
@@ -37,6 +68,15 @@ def enhance_reports(
         raise FileNotFoundError(f"Missing {results_path}. Run the analysis first.")
 
     df = pd.read_csv(results_path, dtype=str).fillna("")
+
+    if "claim_documentation_type" not in df.columns:
+        doc_types = _load_claim_documentation_types(claims_path)
+        if not doc_types.empty and "batch_no" in df.columns:
+            df = df.merge(doc_types, on="batch_no", how="left")
+        else:
+            df["claim_documentation_type"] = "REGULAR"
+    df["claim_documentation_type"] = df["claim_documentation_type"].fillna("REGULAR").astype(str).str.upper().str.strip()
+    df.loc[df["claim_documentation_type"] == "", "claim_documentation_type"] = "REGULAR"
 
     if "claims_amount" not in df.columns and "total_amount_per_batch" in df.columns:
         df["claims_amount"] = df["total_amount_per_batch"]
@@ -70,6 +110,7 @@ def enhance_reports(
     preferred_cols = [
         "batch_no",
         "provider",
+        "claim_documentation_type",
         "payment_status",
         "supplier_category_name",
         "claims_amount",
@@ -87,12 +128,14 @@ def enhance_reports(
     other_cols = [col for col in df.columns if col not in existing_cols]
     df = df[existing_cols + other_cols]
 
+    regular = df[df["claim_documentation_type"] == "REGULAR"].copy()
+    reimbursement = df[df["claim_documentation_type"] == "REIMBURSEMENT"].copy()
     paid = df[df["payment_status"] == "PAID"].copy()
     unpaid = df[df["payment_status"] == "UNPAID"].copy()
     variances = df[df["reconciliation_status"] == "VARIANCE"].copy()
 
     provider_totals = (
-        df.groupby("provider", dropna=False)
+        df.groupby(["claim_documentation_type", "provider"], dropna=False)
         .agg(
             batch_count=("batch_no", "count"),
             paid_batches=("payment_status", lambda s: int((s == "PAID").sum())),
@@ -112,7 +155,7 @@ def enhance_reports(
     provider_totals = provider_totals.sort_values("claims_amount", ascending=False)
 
     date_summary = (
-        df.groupby("check_date", dropna=False)
+        df.groupby(["claim_documentation_type", "check_date"], dropna=False)
         .agg(
             batch_count=("batch_no", "count"),
             paid_batches=("payment_status", lambda s: int((s == "PAID").sum())),
@@ -127,25 +170,30 @@ def enhance_reports(
     for col in ["claims_amount", "check_amount", "difference"]:
         date_summary[col] = _money(date_summary[col])
 
+    summary_base = regular
     summary = pd.DataFrame(
         [
             {"metric": "total_batches", "value": len(df)},
-            {"metric": "paid_batches", "value": len(paid)},
-            {"metric": "unpaid_batches", "value": len(unpaid)},
-            {"metric": "hospital_count", "value": int((df["supplier_category_name"] == "Hospital").sum())},
-            {"metric": "professional_count", "value": int((df["supplier_category_name"] == "Professional").sum())},
-            {"metric": "matched_batches", "value": int((df["reconciliation_status"] == "MATCHED").sum())},
-            {"metric": "variance_batches", "value": len(variances)},
-            {"metric": "claims_total_amount", "value": round(float(df["claims_amount"].sum()), 2)},
-            {"metric": "withholding_tax_total", "value": round(float(df["withholding_tax"].sum()), 2)},
-            {"metric": "expected_check_total", "value": round(float(df["expected_check_amount"].sum()), 2)},
-            {"metric": "actual_check_total", "value": round(float(df["check_amount"].sum()), 2)},
-            {"metric": "total_difference", "value": round(float(df["difference"].sum()), 2)},
-            {"metric": "total_providers", "value": provider_totals["provider"].nunique()},
+            {"metric": "regular_batches", "value": len(regular)},
+            {"metric": "reimbursement_batches_excluded", "value": len(reimbursement)},
+            {"metric": "paid_batches", "value": int((summary_base["payment_status"] == "PAID").sum())},
+            {"metric": "unpaid_batches", "value": int((summary_base["payment_status"] == "UNPAID").sum())},
+            {"metric": "hospital_count", "value": int((summary_base["supplier_category_name"] == "Hospital").sum())},
+            {"metric": "professional_count", "value": int((summary_base["supplier_category_name"] == "Professional").sum())},
+            {"metric": "matched_batches", "value": int((summary_base["reconciliation_status"] == "MATCHED").sum())},
+            {"metric": "variance_batches", "value": int((summary_base["reconciliation_status"] == "VARIANCE").sum())},
+            {"metric": "claims_total_amount", "value": round(float(summary_base["claims_amount"].sum()), 2)},
+            {"metric": "withholding_tax_total", "value": round(float(summary_base["withholding_tax"].sum()), 2)},
+            {"metric": "expected_check_total", "value": round(float(summary_base["expected_check_amount"].sum()), 2)},
+            {"metric": "actual_check_total", "value": round(float(summary_base["check_amount"].sum()), 2)},
+            {"metric": "total_difference", "value": round(float(summary_base["difference"].sum()), 2)},
+            {"metric": "total_providers", "value": summary_base["provider"].nunique()},
         ]
     )
 
     df.to_csv(reports_path / "claims_analysis_output.csv", index=False)
+    regular.to_csv(reports_path / "regular_claims.csv", index=False)
+    reimbursement.to_csv(reports_path / "reimbursement_claims_excluded.csv", index=False)
     df.to_csv(reports_path / "amount_reconciliation_by_batch.csv", index=False)
     paid.to_csv(reports_path / "paid_batches.csv", index=False)
     unpaid.to_csv(reports_path / "unpaid_batches.csv", index=False)
@@ -159,12 +207,13 @@ def enhance_reports(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Enhance generated Claims Analysis reports with payment status, provider totals, and date summaries.")
+    parser = argparse.ArgumentParser(description="Enhance generated Claims Analysis reports with payment status, provider totals, date summaries, and documentation type filtering.")
     parser.add_argument("--reports-dir", default="reports/latest")
     parser.add_argument("--withholding-rate", type=float, default=0.02)
     parser.add_argument("--tolerance", type=float, default=0.01)
+    parser.add_argument("--claims", default="data/raw/CLAIMS PROCESS-FINAL.csv", help="Claims Process CSV used to add claim_documentation_type")
     args = parser.parse_args()
-    path = enhance_reports(args.reports_dir, args.withholding_rate, args.tolerance)
+    path = enhance_reports(args.reports_dir, args.withholding_rate, args.tolerance, args.claims)
     print(f"Enhanced reports written to: {path}")
 
 
