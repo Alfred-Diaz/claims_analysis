@@ -84,10 +84,8 @@ def render_html(data: dict[str, object]) -> str:
       --muted: #64748b;
       --border: #dbe3ef;
       --primary: #1d4ed8;
-      --primary-soft: #eff6ff;
       --danger: #b91c1c;
       --good: #047857;
-      --warn: #b45309;
     }}
     * {{ box-sizing: border-box; }}
     body {{ margin: 0; font-family: Arial, Helvetica, sans-serif; background: var(--bg); color: var(--text); }}
@@ -95,22 +93,23 @@ def render_html(data: dict[str, object]) -> str:
     header h1 {{ margin: 0 0 6px 0; font-size: clamp(20px, 2.2vw, 30px); }}
     header p {{ margin: 0; color: #cbd5e1; font-size: 13px; }}
     main {{ padding: 22px; }}
-    .layout {{ display: grid; grid-template-columns: 285px minmax(0, 1fr); gap: 18px; align-items: start; }}
-    .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08); }}
-    .filters {{ position: sticky; top: 14px; }}
+    .layout {{ display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 18px; align-items: start; }}
+    .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 16px; box-shadow: 0 1px 3px rgba(15, 23, 42, 0.08); min-width: 0; }}
+    .filters {{ position: sticky; top: 14px; max-height: calc(100vh - 28px); overflow: auto; }}
     .filters h2, .section-title {{ margin: 0 0 12px 0; font-size: 16px; }}
     label {{ display: block; font-size: 12px; color: var(--muted); margin: 12px 0 5px; }}
     select, input {{ width: 100%; padding: 10px 11px; border: 1px solid var(--border); border-radius: 9px; background: white; }}
+    .date-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }}
     .filter-actions {{ display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }}
     button {{ border: 1px solid var(--border); background: white; padding: 10px 12px; border-radius: 9px; cursor: pointer; font-weight: 700; }}
     button.primary {{ background: var(--primary); color: white; border-color: var(--primary); }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 12px; margin-bottom: 16px; }}
-    .metric-card {{ min-width: 0; overflow: hidden; }}
-    .metric-label {{ color: var(--muted); font-size: clamp(10px, 1vw, 12px); margin-bottom: 8px; white-space: normal; line-height: 1.25; }}
-    .metric-value {{ font-size: clamp(16px, 2vw, 25px); font-weight: 800; line-height: 1.15; overflow-wrap: anywhere; word-break: break-word; }}
-    .charts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; margin-bottom: 16px; }}
-    .chart-box {{ height: 300px; }}
-    .chart-box canvas {{ width: 100% !important; height: 100% !important; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-bottom: 16px; }}
+    .metric-card {{ min-height: 105px; display: flex; flex-direction: column; justify-content: space-between; overflow: hidden; }}
+    .metric-label {{ color: var(--muted); font-size: clamp(11px, 1vw, 13px); min-height: 34px; white-space: normal; line-height: 1.25; overflow-wrap: anywhere; }}
+    .metric-value {{ font-size: clamp(17px, 1.8vw, 26px); font-weight: 800; line-height: 1.15; overflow-wrap: anywhere; word-break: break-word; }}
+    .charts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; margin-bottom: 16px; }}
+    .chart-box {{ height: 360px; overflow: hidden; }}
+    .chart-box canvas {{ width: 100% !important; height: 300px !important; }}
     .tabs {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }}
     .tab {{ border-radius: 999px; padding: 9px 13px; }}
     .tab.active {{ background: var(--primary); color: white; border-color: var(--primary); }}
@@ -124,7 +123,7 @@ def render_html(data: dict[str, object]) -> str:
     .status-review, .status-variance, .status-unpaid {{ color: var(--danger); font-weight: 800; }}
     .status-ok, .status-matched, .status-paid {{ color: var(--good); font-weight: 800; }}
     footer {{ padding: 0 24px 24px; color: var(--muted); font-size: 12px; }}
-    @media (max-width: 900px) {{ .layout {{ grid-template-columns: 1fr; }} .filters {{ position: static; }} .toolbar {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 1050px) {{ .layout {{ grid-template-columns: 1fr; }} .filters {{ position: static; max-height: none; }} .toolbar {{ grid-template-columns: 1fr; }} }}
   </style>
 </head>
 <body>
@@ -136,18 +135,38 @@ def render_html(data: dict[str, object]) -> str:
     <div class=\"layout\">
       <aside class=\"card filters\">
         <h2>Filters</h2>
+
         <label>Provider / Hospital</label>
         <select id=\"providerFilter\"></select>
+        <input id=\"providerTextFilter\" placeholder=\"Type provider/hospital name...\" />
+
         <label>Payment Status</label>
         <select id=\"paymentFilter\"><option value=\"ALL\">All</option><option value=\"PAID\">Paid</option><option value=\"UNPAID\">Unpaid</option></select>
+
         <label>Supplier Category</label>
         <select id=\"categoryFilter\"><option value=\"ALL\">All</option><option value=\"Hospital\">Hospital</option><option value=\"Professional\">Professional</option></select>
+
         <label>Reconciliation Status</label>
         <select id=\"reconFilter\"><option value=\"ALL\">All</option><option value=\"MATCHED\">Matched</option><option value=\"VARIANCE\">Variance</option></select>
-        <label>Check Date</label>
-        <select id=\"dateFilter\"></select>
-        <label>Search</label>
-        <input id=\"searchInput\" placeholder=\"Batch no, provider, check no, CV no...\" />
+
+        <label>Date Created / Check Date Range</label>
+        <div class=\"date-row\">
+          <input id=\"dateFromFilter\" type=\"date\" />
+          <input id=\"dateToFilter\" type=\"date\" />
+        </div>
+
+        <label>Batch No</label>
+        <input id=\"batchTextFilter\" placeholder=\"Type batch no...\" />
+
+        <label>Check No</label>
+        <input id=\"checkTextFilter\" placeholder=\"Type check no...\" />
+
+        <label>CV No</label>
+        <input id=\"cvTextFilter\" placeholder=\"Type CV no...\" />
+
+        <label>Global Search</label>
+        <input id=\"searchInput\" placeholder=\"Search any visible value...\" />
+
         <div class=\"filter-actions\"><button class=\"primary\" onclick=\"applyFilters()\">Apply</button><button onclick=\"resetFilters()\">Reset</button></div>
       </aside>
       <section>
@@ -159,91 +178,131 @@ def render_html(data: dict[str, object]) -> str:
         </section>
         <section class=\"card\">
           <div class=\"tabs\" id=\"tabs\"></div>
-          <div class=\"toolbar\"><span class=\"note\" id=\"tableNote\"></span><button onclick=\"downloadActiveCsv()\">Open CSV name</button></div>
+          <div class=\"toolbar\"><span class=\"note\" id=\"tableNote\"></span><button onclick=\"downloadActiveCsv()\">CSV file name</button></div>
           <div class=\"table-wrap\" id=\"tableWrap\"></div>
         </section>
       </section>
     </div>
   </main>
-  <footer>Dashboard generated from enhanced Claims Analysis reports. Data is previewed for browser performance.</footer>
+  <footer>Dashboard generated from enhanced Claims Analysis reports. Filters apply to KPI cards, charts, and table rows.</footer>
 <script>
 const DATA = {payload};
 const TABLE_LABELS = {{
-  provider_reconciliation: 'Provider Totals',
-  results: 'All Batches',
-  paid: 'Paid',
-  unpaid: 'Unpaid',
-  variances: 'Batch Variances',
-  for_review: 'For Review',
-  duplicate_checks: 'Duplicate Checks',
-  duplicate_cv: 'Duplicate CV',
-  date_summary: 'Date Summary'
+  provider_reconciliation: 'Provider Totals', results: 'All Batches', paid: 'Paid', unpaid: 'Unpaid', variances: 'Batch Variances', for_review: 'For Review', duplicate_checks: 'Duplicate Checks', duplicate_cv: 'Duplicate CV', date_summary: 'Date Summary'
 }};
 const FILE_NAMES = {{
-  provider_reconciliation: 'provider_amount_reconciliation.csv',
-  results: 'claims_analysis_output.csv',
-  paid: 'paid_batches.csv',
-  unpaid: 'unpaid_batches.csv',
-  variances: 'batch_variances.csv',
-  for_review: 'for_review.csv',
-  duplicate_checks: 'duplicate_checks.csv',
-  duplicate_cv: 'duplicate_cv.csv',
-  date_summary: 'date_created_summary.csv'
+  provider_reconciliation: 'provider_amount_reconciliation.csv', results: 'claims_analysis_output.csv', paid: 'paid_batches.csv', unpaid: 'unpaid_batches.csv', variances: 'batch_variances.csv', for_review: 'for_review.csv', duplicate_checks: 'duplicate_checks.csv', duplicate_cv: 'duplicate_cv.csv', date_summary: 'date_created_summary.csv'
 }};
 const TABLE_KEYS = ['provider_reconciliation','results','paid','unpaid','variances','for_review','duplicate_checks','duplicate_cv','date_summary'];
 let activeTable = 'provider_reconciliation';
-let filteredRows = [];
 let charts = {{}};
 
 function num(v) {{ const n = Number(String(v ?? '').replaceAll(',', '')); return Number.isNaN(n) ? 0 : n; }}
 function money(v) {{ return num(v).toLocaleString(undefined, {{minimumFractionDigits: 2, maximumFractionDigits: 2}}); }}
 function fmt(v) {{ const n = Number(v); return !Number.isNaN(n) && String(v ?? '').match(/^[-0-9.]+$/) ? n.toLocaleString() : (v ?? '0'); }}
 function rows(key) {{ return DATA.tables[key] || []; }}
-function escapeHtml(value) {{ return String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;'); }}
 function getMainRows() {{ return rows('results'); }}
+function escapeHtml(value) {{ return String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;'); }}
+function norm(v) {{ return String(v ?? '').trim().toLowerCase(); }}
+function includesText(value, query) {{ return !query || norm(value).includes(query); }}
+function rowDateValue(row) {{ return row.date_created || row.created_date || row.check_date || ''; }}
+function parseDate(value) {{
+  const text = String(value ?? '').split(',')[0].trim();
+  if (!text || text === 'NO CHECK DATE') return null;
+  const d = new Date(text);
+  return Number.isNaN(d.getTime()) ? null : d;
+}}
 
 function populateFilters() {{
   document.getElementById('reportPath').textContent = `Source: ${{DATA.reports_dir}}`;
   const providers = [...new Set(getMainRows().map(r => r.provider || 'UNKNOWN'))].sort();
   document.getElementById('providerFilter').innerHTML = '<option value="ALL">All Providers</option>' + providers.map(p => `<option value="${{escapeHtml(p)}}">${{escapeHtml(p)}}</option>`).join('');
-  const dates = [...new Set(getMainRows().map(r => r.check_date || 'NO CHECK DATE'))].sort();
-  document.getElementById('dateFilter').innerHTML = '<option value="ALL">All Dates</option>' + dates.map(d => `<option value="${{escapeHtml(d)}}">${{escapeHtml(d)}}</option>`).join('');
 }}
 
-function currentFilterValues() {{
+function filterValues() {{
   return {{
     provider: document.getElementById('providerFilter').value,
+    providerText: norm(document.getElementById('providerTextFilter').value),
     payment: document.getElementById('paymentFilter').value,
     category: document.getElementById('categoryFilter').value,
     recon: document.getElementById('reconFilter').value,
-    date: document.getElementById('dateFilter').value,
-    search: document.getElementById('searchInput').value.trim().toLowerCase()
+    dateFrom: document.getElementById('dateFromFilter').value ? new Date(document.getElementById('dateFromFilter').value) : null,
+    dateTo: document.getElementById('dateToFilter').value ? new Date(document.getElementById('dateToFilter').value) : null,
+    batchText: norm(document.getElementById('batchTextFilter').value),
+    checkText: norm(document.getElementById('checkTextFilter').value),
+    cvText: norm(document.getElementById('cvTextFilter').value),
+    search: norm(document.getElementById('searchInput').value)
   }};
 }}
 
+function passesDate(row, f) {{
+  if (!f.dateFrom && !f.dateTo) return true;
+  const d = parseDate(rowDateValue(row));
+  if (!d) return false;
+  if (f.dateFrom && d < f.dateFrom) return false;
+  if (f.dateTo) {{ const end = new Date(f.dateTo); end.setHours(23,59,59,999); if (d > end) return false; }}
+  return true;
+}}
+
 function filterBatchRows(inputRows) {{
-  const f = currentFilterValues();
+  const f = filterValues();
   return inputRows.filter(r => {{
     const provider = r.provider || 'UNKNOWN';
-    const date = r.check_date || 'NO CHECK DATE';
-    const text = Object.values(r).join(' ').toLowerCase();
+    const allText = Object.values(r).join(' ').toLowerCase();
     return (f.provider === 'ALL' || provider === f.provider)
+      && includesText(provider, f.providerText)
       && (f.payment === 'ALL' || r.payment_status === f.payment)
       && (f.category === 'ALL' || r.supplier_category_name === f.category)
       && (f.recon === 'ALL' || r.reconciliation_status === f.recon)
-      && (f.date === 'ALL' || date === f.date)
-      && (!f.search || text.includes(f.search));
+      && includesText(r.batch_no, f.batchText)
+      && includesText(r.check_no, f.checkText)
+      && includesText(r.cv_no, f.cvText)
+      && passesDate(r, f)
+      && (!f.search || allText.includes(f.search));
   }});
 }}
 
+function groupProviderRowsFromFilteredBatches() {{
+  const map = new Map();
+  filterBatchRows(getMainRows()).forEach(r => {{
+    const provider = r.provider || 'UNKNOWN';
+    if (!map.has(provider)) map.set(provider, {{provider, batch_count:0, paid_batches:0, unpaid_batches:0, claims_amount:0, withholding_tax:0, expected_check_amount:0, check_amount:0, difference:0, variance_batch_count:0}});
+    const p = map.get(provider);
+    p.batch_count += 1;
+    if (r.payment_status === 'PAID') p.paid_batches += 1;
+    if (r.payment_status === 'UNPAID') p.unpaid_batches += 1;
+    p.claims_amount += num(r.claims_amount);
+    p.withholding_tax += num(r.withholding_tax);
+    p.expected_check_amount += num(r.expected_check_amount);
+    p.check_amount += num(r.check_amount);
+    p.difference += num(r.difference);
+    if (r.reconciliation_status === 'VARIANCE') p.variance_batch_count += 1;
+  }});
+  return [...map.values()].map(r => {{ ['claims_amount','withholding_tax','expected_check_amount','check_amount','difference'].forEach(c => r[c] = money(r[c])); return r; }}).sort((a,b)=>num(b.claims_amount)-num(a.claims_amount));
+}}
+
+function groupDateRowsFromFilteredBatches() {{
+  const map = new Map();
+  filterBatchRows(getMainRows()).forEach(r => {{
+    const date = rowDateValue(r) || 'NO DATE';
+    if (!map.has(date)) map.set(date, {{date_created: date, batch_count:0, paid_batches:0, unpaid_batches:0, claims_amount:0, check_amount:0, difference:0}});
+    const d = map.get(date);
+    d.batch_count += 1;
+    if (r.payment_status === 'PAID') d.paid_batches += 1;
+    if (r.payment_status === 'UNPAID') d.unpaid_batches += 1;
+    d.claims_amount += num(r.claims_amount);
+    d.check_amount += num(r.check_amount);
+    d.difference += num(r.difference);
+  }});
+  return [...map.values()].map(r => {{ ['claims_amount','check_amount','difference'].forEach(c => r[c] = money(r[c])); return r; }});
+}}
+
 function filteredTableRows(key) {{
-  const base = rows(key);
-  if (['results','paid','unpaid','variances','for_review'].includes(key)) return filterBatchRows(base);
-  if (key === 'provider_reconciliation') {{
-    const f = currentFilterValues();
-    return base.filter(r => (f.provider === 'ALL' || (r.provider || 'UNKNOWN') === f.provider) && (!f.search || Object.values(r).join(' ').toLowerCase().includes(f.search)));
-  }}
-  return base.filter(r => !currentFilterValues().search || Object.values(r).join(' ').toLowerCase().includes(currentFilterValues().search));
+  if (key === 'provider_reconciliation') return groupProviderRowsFromFilteredBatches();
+  if (key === 'date_summary') return groupDateRowsFromFilteredBatches();
+  if (['results','paid','unpaid','variances','for_review'].includes(key)) return filterBatchRows(rows(key));
+  const f = filterValues();
+  return rows(key).filter(r => !f.search || Object.values(r).join(' ').toLowerCase().includes(f.search));
 }}
 
 function calcMetrics() {{
@@ -261,53 +320,39 @@ function calcMetrics() {{
   ];
 }}
 
-function renderMetrics() {{
-  document.getElementById('metrics').innerHTML = calcMetrics().map(([label,value]) => `<div class="card metric-card"><div class="metric-label">${{label}}</div><div class="metric-value">${{value}}</div></div>`).join('');
-}}
-
+function renderMetrics() {{ document.getElementById('metrics').innerHTML = calcMetrics().map(([label,value]) => `<div class="card metric-card"><div class="metric-label">${{label}}</div><div class="metric-value">${{value}}</div></div>`).join(''); }}
 function destroyCharts() {{ Object.values(charts).forEach(c => c.destroy()); charts = {{}}; }}
+function shortLabel(s) {{ return String(s || '').length > 28 ? String(s).slice(0,25) + '...' : s; }}
 function renderCharts() {{
   destroyCharts();
   const data = filterBatchRows(getMainRows());
   const paid = data.filter(r => r.payment_status === 'PAID').length;
   const unpaid = data.filter(r => r.payment_status === 'UNPAID').length;
-  charts.payment = new Chart(document.getElementById('paymentChart'), {{type:'doughnut', data:{{labels:['Paid','Unpaid'], datasets:[{{data:[paid,unpaid]}}]}}, options:{{responsive:true, maintainAspectRatio:false}}}});
-
+  charts.payment = new Chart(document.getElementById('paymentChart'), {{type:'doughnut', data:{{labels:['Paid','Unpaid'], datasets:[{{data:[paid,unpaid]}}]}}, options:{{responsive:true, maintainAspectRatio:false, plugins:{{legend:{{position:'bottom'}}}}}}}});
   const providerMap = new Map();
   data.forEach(r => providerMap.set(r.provider || 'UNKNOWN', (providerMap.get(r.provider || 'UNKNOWN') || 0) + num(r.claims_amount)));
   const top = [...providerMap.entries()].sort((a,b)=>b[1]-a[1]).slice(0,10);
-  charts.provider = new Chart(document.getElementById('providerChart'), {{type:'bar', data:{{labels:top.map(x=>x[0]), datasets:[{{label:'Claims Amount', data:top.map(x=>x[1])}}]}}, options:{{indexAxis:'y', responsive:true, maintainAspectRatio:false}}}});
-
-  const claims = data.reduce((a,r)=>a+num(r.claims_amount),0);
-  const expected = data.reduce((a,r)=>a+num(r.expected_check_amount),0);
-  const actual = data.reduce((a,r)=>a+num(r.check_amount),0);
-  charts.amount = new Chart(document.getElementById('amountChart'), {{type:'bar', data:{{labels:['Claims','Expected Check','Actual Check'], datasets:[{{label:'Amount', data:[claims,expected,actual]}}]}}, options:{{responsive:true, maintainAspectRatio:false}}}});
+  charts.provider = new Chart(document.getElementById('providerChart'), {{type:'bar', data:{{labels:top.map(x=>shortLabel(x[0])), datasets:[{{label:'Claims Amount', data:top.map(x=>x[1])}}]}}, options:{{indexAxis:'y', responsive:true, maintainAspectRatio:false, plugins:{{legend:{{display:false}}}}, scales:{{y:{{ticks:{{font:{{size:10}}}}}}}}}}}});
+  charts.amount = new Chart(document.getElementById('amountChart'), {{type:'bar', data:{{labels:['Claims','Expected Check','Actual Check'], datasets:[{{label:'Amount', data:[data.reduce((a,r)=>a+num(r.claims_amount),0), data.reduce((a,r)=>a+num(r.expected_check_amount),0), data.reduce((a,r)=>a+num(r.check_amount),0)]}}]}}, options:{{responsive:true, maintainAspectRatio:false, plugins:{{legend:{{display:false}}}}}}}});
 }}
 
-function renderTabs() {{
-  document.getElementById('tabs').innerHTML = TABLE_KEYS.map(key => `<button class="tab ${{key===activeTable?'active':''}}" onclick="setTable('${{key}}')">${{TABLE_LABELS[key]}} (${{fmt(DATA.row_counts[key] || rows(key).length)}})</button>`).join('');
-}}
-function setTable(key) {{ activeTable = key; renderTabs(); renderTable(); }}
-function statusClass(c,v) {{
-  if (c === 'payment_status') return v === 'PAID' ? 'status-paid' : 'status-unpaid';
-  if (c === 'reconciliation_status') return v === 'MATCHED' ? 'status-matched' : 'status-variance';
-  if (c === 'payee_match_status') return v === 'OK' ? 'status-ok' : v === 'For Review' ? 'status-review' : '';
-  return '';
-}}
+function renderTabs() {{ document.getElementById('tabs').innerHTML = TABLE_KEYS.map(key => `<button class="tab ${{key===activeTable?'active':''}}" onclick="setTable('${{key}}')">${{TABLE_LABELS[key]}} (${{filteredTableRows(key).length.toLocaleString()}})</button>`).join(''); }}
+function setTable(key) {{ activeTable = key; applyFilters(); }}
+function statusClass(c,v) {{ if (c === 'payment_status') return v === 'PAID' ? 'status-paid' : 'status-unpaid'; if (c === 'reconciliation_status') return v === 'MATCHED' ? 'status-matched' : 'status-variance'; if (c === 'payee_match_status') return v === 'OK' ? 'status-ok' : v === 'For Review' ? 'status-review' : ''; return ''; }}
 function renderTable() {{
   const tableRows = filteredTableRows(activeTable);
-  document.getElementById('tableNote').textContent = `Showing ${{tableRows.length.toLocaleString()}} preview rows. Full CSV: ${{FILE_NAMES[activeTable]}}`;
+  document.getElementById('tableNote').textContent = `Showing ${{tableRows.length.toLocaleString()}} filtered preview rows. Source CSV: ${{FILE_NAMES[activeTable]}}`;
   const wrap = document.getElementById('tableWrap');
-  if (!tableRows.length) {{ wrap.innerHTML = '<div style="padding:18px" class="note">No rows to display.</div>'; return; }}
+  if (!tableRows.length) {{ wrap.innerHTML = '<div style="padding:18px" class="note">No rows match the active filters.</div>'; return; }}
   const cols = Object.keys(tableRows[0]);
   wrap.innerHTML = `<table><thead><tr>${{cols.map(c=>`<th>${{escapeHtml(c)}}</th>`).join('')}}</tr></thead><tbody>${{tableRows.map(r=>`<tr>${{cols.map(c=>`<td class="${{statusClass(c,r[c])}}">${{escapeHtml(r[c])}}</td>`).join('')}}</tr>`).join('')}}</tbody></table>`;
 }}
 function applyFilters() {{ renderMetrics(); renderCharts(); renderTabs(); renderTable(); }}
-function resetFilters() {{ ['providerFilter','paymentFilter','categoryFilter','reconFilter','dateFilter'].forEach(id => document.getElementById(id).value='ALL'); document.getElementById('searchInput').value=''; applyFilters(); }}
+function resetFilters() {{ ['providerFilter','paymentFilter','categoryFilter','reconFilter'].forEach(id => document.getElementById(id).value='ALL'); ['providerTextFilter','dateFromFilter','dateToFilter','batchTextFilter','checkTextFilter','cvTextFilter','searchInput'].forEach(id => document.getElementById(id).value=''); applyFilters(); }}
 function downloadActiveCsv() {{ alert(`Open this file from reports/latest: ${{FILE_NAMES[activeTable]}}`); }}
 
-document.getElementById('searchInput').addEventListener('input', applyFilters);
-['providerFilter','paymentFilter','categoryFilter','reconFilter','dateFilter'].forEach(id => document.getElementById(id).addEventListener('change', applyFilters));
+['providerTextFilter','dateFromFilter','dateToFilter','batchTextFilter','checkTextFilter','cvTextFilter','searchInput'].forEach(id => document.getElementById(id).addEventListener('input', applyFilters));
+['providerFilter','paymentFilter','categoryFilter','reconFilter'].forEach(id => document.getElementById(id).addEventListener('change', applyFilters));
 populateFilters();
 applyFilters();
 </script>
