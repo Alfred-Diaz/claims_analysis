@@ -16,6 +16,8 @@ from pathlib import Path
 import pandas as pd
 
 
+DEFAULT_DASHBOARD_ROW_LIMIT = 100000
+
 REPORT_FILES = {
     "summary": "summary.csv",
     "results": "claims_analysis_output.csv",
@@ -31,7 +33,7 @@ REPORT_FILES = {
 }
 
 
-def read_csv_preview(path: Path, limit: int = 5000) -> list[dict[str, object]]:
+def read_csv_preview(path: Path, limit: int = DEFAULT_DASHBOARD_ROW_LIMIT) -> list[dict[str, object]]:
     if not path.exists():
         return []
     return pd.read_csv(path, dtype=str, nrows=limit).fillna("").to_dict(orient="records")
@@ -53,12 +55,13 @@ def count_rows(path: Path) -> int:
         return max(sum(1 for _ in file) - 1, 0)
 
 
-def build_dashboard_data(reports_dir: Path, preview_limit: int = 5000) -> dict[str, object]:
+def build_dashboard_data(reports_dir: Path, preview_limit: int = DEFAULT_DASHBOARD_ROW_LIMIT) -> dict[str, object]:
     data = {
         "reports_dir": str(reports_dir),
         "summary": read_summary(reports_dir / REPORT_FILES["summary"]),
         "row_counts": {},
         "tables": {},
+        "preview_limit": preview_limit,
     }
     for key, filename in REPORT_FILES.items():
         path = reports_dir / filename
@@ -214,7 +217,7 @@ function parseDate(value) {{
 }}
 
 function populateFilters() {{
-  document.getElementById('reportPath').textContent = `Source: ${{DATA.reports_dir}}`;
+  document.getElementById('reportPath').textContent = `Source: ${{DATA.reports_dir}} | Loaded rows: ${{getMainRows().length.toLocaleString()}} of ${{(DATA.row_counts.results || getMainRows().length).toLocaleString()}}`;
   const providers = [...new Set(getMainRows().map(r => r.provider || 'UNKNOWN'))].sort();
   document.getElementById('providerFilter').innerHTML = '<option value="ALL">All Providers</option>' + providers.map(p => `<option value="${{escapeHtml(p)}}">${{escapeHtml(p)}}</option>`).join('');
 }}
@@ -341,7 +344,9 @@ function setTable(key) {{ activeTable = key; applyFilters(); }}
 function statusClass(c,v) {{ if (c === 'payment_status') return v === 'PAID' ? 'status-paid' : 'status-unpaid'; if (c === 'reconciliation_status') return v === 'MATCHED' ? 'status-matched' : 'status-variance'; if (c === 'payee_match_status') return v === 'OK' ? 'status-ok' : v === 'For Review' ? 'status-review' : ''; return ''; }}
 function renderTable() {{
   const tableRows = filteredTableRows(activeTable);
-  document.getElementById('tableNote').textContent = `Showing ${{tableRows.length.toLocaleString()}} filtered preview rows. Source CSV: ${{FILE_NAMES[activeTable]}}`;
+  const sourceCount = DATA.row_counts[activeTable] || rows(activeTable).length;
+  const loadedCount = rows(activeTable).length;
+  document.getElementById('tableNote').textContent = `Showing ${{tableRows.length.toLocaleString()}} filtered rows. Loaded ${{loadedCount.toLocaleString()}} of ${{sourceCount.toLocaleString()}} source rows. CSV: ${{FILE_NAMES[activeTable]}}`;
   const wrap = document.getElementById('tableWrap');
   if (!tableRows.length) {{ wrap.innerHTML = '<div style="padding:18px" class="note">No rows match the active filters.</div>'; return; }}
   const cols = Object.keys(tableRows[0]);
@@ -361,7 +366,7 @@ applyFilters();
 """
 
 
-def generate_dashboard(reports_dir: str | Path = "reports/latest", preview_limit: int = 5000) -> Path:
+def generate_dashboard(reports_dir: str | Path = "reports/latest", preview_limit: int = DEFAULT_DASHBOARD_ROW_LIMIT) -> Path:
     reports_path = Path(reports_dir)
     reports_path.mkdir(parents=True, exist_ok=True)
     data = build_dashboard_data(reports_path, preview_limit=preview_limit)
@@ -374,7 +379,7 @@ def generate_dashboard(reports_dir: str | Path = "reports/latest", preview_limit
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate local HTML dashboard from Claims Analysis reports.")
     parser.add_argument("--reports-dir", default="reports/latest", help="Folder containing generated report CSV files")
-    parser.add_argument("--preview-limit", type=int, default=5000, help="Maximum rows embedded per table")
+    parser.add_argument("--preview-limit", type=int, default=DEFAULT_DASHBOARD_ROW_LIMIT, help="Maximum rows embedded per table")
     args = parser.parse_args()
     output_path = generate_dashboard(args.reports_dir, preview_limit=args.preview_limit)
     print(f"Dashboard generated: {output_path}")
