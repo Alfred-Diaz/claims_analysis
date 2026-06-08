@@ -9,13 +9,33 @@ from claims_analysis.business_rules import aging_bucket, aging_days, credit_term
 
 
 DEFAULT_SUPPLIERS_PATH = "data/master/EastWest-ERP-Suppliers-20260504_103929.csv"
+ENRICHMENT_COLUMNS = [
+    "supplier_master_name",
+    "provider_code",
+    "supplier_type",
+    "supplier_category_source",
+    "city",
+    "province",
+    "region",
+    "payment_term",
+]
 
 
 def _money(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").fillna(0).round(2)
 
 
+def _scalar(value: object) -> object:
+    if isinstance(value, pd.Series):
+        for item in value.tolist():
+            if not pd.isna(item) and str(item).strip() != "":
+                return item
+        return ""
+    return value
+
+
 def _norm(value: object) -> str:
+    value = _scalar(value)
     return "" if pd.isna(value) else str(value).strip().upper()
 
 
@@ -31,9 +51,9 @@ def _unique_count_from_joined(value: object) -> int:
 
 
 def _payment_status(row: pd.Series) -> str:
-    check_no = str(row.get("check_no", "") or "").strip()
-    check_date = str(row.get("check_date", "") or "").strip()
-    check_amount = float(row.get("check_amount", 0) or 0)
+    check_no = str(_scalar(row.get("check_no", "")) or "").strip()
+    check_date = str(_scalar(row.get("check_date", "")) or "").strip()
+    check_amount = float(_scalar(row.get("check_amount", 0)) or 0)
     if check_no or check_date or check_amount > 0:
         return "PAID"
     return "UNPAID"
@@ -119,13 +139,20 @@ def _load_supplier_master(suppliers_path: str | Path | None) -> pd.DataFrame:
     return df[["supplier_key", "supplier_display_name", "provider_code", "type", "category_name", "city", "state", "region", "payment_term"]]
 
 
+def _drop_existing_enrichment_columns(df: pd.DataFrame) -> pd.DataFrame:
+    drop_cols = [col for col in ENRICHMENT_COLUMNS + ["provider_key", "supplier_key"] if col in df.columns]
+    if drop_cols:
+        return df.drop(columns=drop_cols)
+    return df
+
+
 def _enrich_with_supplier_master(df: pd.DataFrame, suppliers_path: str | Path | None) -> pd.DataFrame:
     master = _load_supplier_master(suppliers_path)
-    df = df.copy()
+    df = _drop_existing_enrichment_columns(df.copy())
     df["provider_key"] = df["provider"].apply(_norm_key)
 
     if master.empty:
-        for col in ["supplier_master_name", "provider_code", "supplier_type", "supplier_category_source", "city", "province", "region", "payment_term"]:
+        for col in ENRICHMENT_COLUMNS:
             df[col] = ""
         return df.drop(columns=["provider_key"])
 
@@ -138,10 +165,10 @@ def _enrich_with_supplier_master(df: pd.DataFrame, suppliers_path: str | Path | 
             "state": "province",
         }
     )
-    for col in ["supplier_master_name", "provider_code", "supplier_type", "supplier_category_source", "city", "province", "region", "payment_term"]:
+    for col in ENRICHMENT_COLUMNS:
         if col not in enriched.columns:
             enriched[col] = ""
-        enriched[col] = enriched[col].fillna("")
+        enriched[col] = enriched[col].fillna("").astype(str).str.strip()
     return enriched.drop(columns=[col for col in ["provider_key", "supplier_key"] if col in enriched.columns])
 
 
@@ -178,7 +205,9 @@ def enhance_reports(
     if "check_amount" not in df.columns:
         df["check_amount"] = 0
 
+    source_supplier_category = df["supplier_category_name"].copy() if "supplier_category_name" in df.columns else pd.Series([""] * len(df))
     df = _enrich_with_supplier_master(df, suppliers_path)
+    df["source_supplier_category"] = source_supplier_category.values
 
     df["claims_amount"] = _money(df["claims_amount"])
     df["check_amount"] = _money(df["check_amount"])
@@ -190,14 +219,13 @@ def enhance_reports(
             row.get("claim_documentation_type", ""),
             row.get("supplier_type", ""),
             row.get("supplier_category_source", ""),
-            row.get("supplier_category_name", ""),
+            row.get("source_supplier_category", ""),
         ),
         axis=1,
     )
 
-    # Credit term priority: supplier master payment_term, then hard-coded priority terms.
     df["credit_term"] = df.apply(
-        lambda row: str(row.get("payment_term", "")).strip() or credit_term_for_provider(row.get("provider", "")),
+        lambda row: str(_scalar(row.get("payment_term", ""))).strip() or credit_term_for_provider(row.get("provider", "")),
         axis=1,
     )
     df["mpsu_tag"] = df.apply(lambda row: mpsu_tag_for_provider(row.get("provider", "")), axis=1)
@@ -248,7 +276,7 @@ def enhance_reports(
         "payee_match_status",
     ]
     existing_cols = [col for col in preferred_cols if col in df.columns]
-    other_cols = [col for col in df.columns if col not in existing_cols]
+    other_cols = [col for col in df.columns if col not in existing_cols and col != "source_supplier_category"]
     df = df[existing_cols + other_cols]
 
     regular = df[df["claim_documentation_type"] == "REGULAR"].copy()
