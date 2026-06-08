@@ -9,10 +9,75 @@ from typing import Any
 DEFAULT_DB_PATH = "data/payments.db"
 
 
+REFERENCE_FIELDS = {
+    "provider",
+    "supplier_category_name",
+    "region",
+    "province",
+    "city",
+    "date_received",
+    "aging_days",
+    "aging_bucket",
+    "credit_term",
+    "term_days",
+    "mpsu_tag",
+    "payment_status",
+    "payment_schedule_status",
+    "payment_calendar_month",
+    "calendar_payment_date",
+    "scheduled_payment_date",
+    "check_date",
+    "claims_amount",
+    "expected_check_amount",
+    "check_amount",
+    "difference",
+    "cv_no",
+    "check_no",
+    "claim_documentation_type",
+}
+
+EDITABLE_FIELDS = {
+    "tagged_for_payment",
+    "processor_name",
+    "target_payment_date",
+    "tagged_date",
+    "payment_priority",
+    "payment_remarks",
+    "approval_status",
+    "released_status",
+    "paid_status",
+}
+
+ALL_TAG_COLUMNS = ["batch_no", *sorted(REFERENCE_FIELDS), *sorted(EDITABLE_FIELDS), "created_at", "updated_at"]
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS payment_tags (
     batch_no TEXT PRIMARY KEY,
     provider TEXT,
+    supplier_category_name TEXT DEFAULT '',
+    region TEXT DEFAULT '',
+    province TEXT DEFAULT '',
+    city TEXT DEFAULT '',
+    date_received TEXT DEFAULT '',
+    aging_days TEXT DEFAULT '',
+    aging_bucket TEXT DEFAULT '',
+    credit_term TEXT DEFAULT '',
+    term_days TEXT DEFAULT '',
+    mpsu_tag TEXT DEFAULT '',
+    payment_status TEXT DEFAULT '',
+    payment_schedule_status TEXT DEFAULT '',
+    payment_calendar_month TEXT DEFAULT '',
+    calendar_payment_date TEXT DEFAULT '',
+    scheduled_payment_date TEXT DEFAULT '',
+    check_date TEXT DEFAULT '',
+    claims_amount TEXT DEFAULT '',
+    expected_check_amount TEXT DEFAULT '',
+    check_amount TEXT DEFAULT '',
+    difference TEXT DEFAULT '',
+    cv_no TEXT DEFAULT '',
+    check_no TEXT DEFAULT '',
+    claim_documentation_type TEXT DEFAULT '',
     tagged_for_payment TEXT DEFAULT '',
     processor_name TEXT DEFAULT '',
     target_payment_date TEXT DEFAULT '',
@@ -39,19 +104,6 @@ CREATE TABLE IF NOT EXISTS payment_tag_history (
 """
 
 
-EDITABLE_FIELDS = {
-    "tagged_for_payment",
-    "processor_name",
-    "target_payment_date",
-    "tagged_date",
-    "payment_priority",
-    "payment_remarks",
-    "approval_status",
-    "released_status",
-    "paid_status",
-}
-
-
 def connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -60,10 +112,25 @@ def connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+def _existing_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    existing = _existing_columns(conn, "payment_tags")
+    for column in ALL_TAG_COLUMNS:
+        if column not in existing:
+            if column == "batch_no":
+                continue
+            conn.execute(f"ALTER TABLE payment_tags ADD COLUMN {column} TEXT DEFAULT ''")
+
+
 def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> Path:
     path = Path(db_path)
     with connect(path) as conn:
         conn.executescript(SCHEMA_SQL)
+        _ensure_columns(conn)
         conn.commit()
     return path
 
@@ -82,6 +149,35 @@ def get_tag(batch_no: str, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, A
     return dict(row) if row else None
 
 
+def _insert_blank(conn: sqlite3.Connection, batch_no: str, provider: str, now: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO payment_tags (batch_no, provider, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (batch_no, provider, now, now),
+    )
+
+
+def upsert_reference(batch_no: str, values: dict[str, Any], db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
+    if not batch_no:
+        raise ValueError("batch_no is required")
+    init_db(db_path)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    allowed = {key: str(value or "") for key, value in values.items() if key in REFERENCE_FIELDS}
+    provider = str(values.get("provider", "") or "")
+
+    with connect(db_path) as conn:
+        existing = conn.execute("SELECT * FROM payment_tags WHERE batch_no = ?", (batch_no,)).fetchone()
+        if not existing:
+            _insert_blank(conn, batch_no, provider, now)
+        for field, new_value in allowed.items():
+            conn.execute(f"UPDATE payment_tags SET {field} = ?, updated_at = ? WHERE batch_no = ?", (new_value, now, batch_no))
+        conn.commit()
+        row = conn.execute("SELECT * FROM payment_tags WHERE batch_no = ?", (batch_no,)).fetchone()
+    return dict(row)
+
+
 def upsert_tag(batch_no: str, values: dict[str, Any], db_path: str | Path = DEFAULT_DB_PATH, actor: str = "") -> dict[str, Any]:
     if not batch_no:
         raise ValueError("batch_no is required")
@@ -94,13 +190,7 @@ def upsert_tag(batch_no: str, values: dict[str, Any], db_path: str | Path = DEFA
     with connect(db_path) as conn:
         existing = conn.execute("SELECT * FROM payment_tags WHERE batch_no = ?", (batch_no,)).fetchone()
         if not existing:
-            conn.execute(
-                """
-                INSERT INTO payment_tags (batch_no, provider, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (batch_no, provider, now, now),
-            )
+            _insert_blank(conn, batch_no, provider, now)
             existing = conn.execute("SELECT * FROM payment_tags WHERE batch_no = ?", (batch_no,)).fetchone()
 
         before = dict(existing)
