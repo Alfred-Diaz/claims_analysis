@@ -26,12 +26,6 @@ SEARCH_COLUMNS = [
     "payment_remarks",
 ]
 
-BULK_FIELDS = {
-    "provider": "provider",
-    "date_received": "date_received",
-    "region": "region",
-}
-
 
 def _where_clause(args):
     where = ["1 = 1"]
@@ -70,17 +64,6 @@ def _where_clause(args):
         params.append(date_to)
 
     return " WHERE " + " AND ".join(where), params
-
-
-def _bulk_where(field: str, values: list[str]) -> tuple[str, list[str]]:
-    col = BULK_FIELDS.get(field)
-    if not col:
-        raise ValueError("Invalid bulk field")
-    clean = [str(v).strip() for v in values if str(v).strip()]
-    if not clean:
-        raise ValueError("No values selected")
-    placeholders = ",".join(["?"] * len(clean))
-    return f"WHERE COALESCE({col}, '') IN ({placeholders}) AND UPPER(COALESCE(payment_status,'')) = 'UNPAID'", clean
 
 
 def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
@@ -136,85 +119,91 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
 
         return jsonify({"rows": [dict(row) for row in rows], "total": total, "page": page, "page_size": page_size, "metrics": dict(metric)})
 
-    @app.get("/api/bulk-values")
-    def api_bulk_values():
-        field = request.args.get("field", "provider")
-        col = BULK_FIELDS.get(field)
-        if not col:
-            return jsonify({"error": "Invalid field"}), 400
+    @app.get("/api/providers")
+    def api_providers():
+        q = (request.args.get("q") or "").strip()
+        params: list[str] = []
+        provider_filter = ""
+        if q:
+            provider_filter = "AND provider LIKE ?"
+            params.append(f"%{q}%")
         with connect(db_path) as conn:
             rows = conn.execute(
                 f"""
-                SELECT COALESCE({col}, '') AS value,
+                SELECT provider,
+                       region,
+                       credit_term,
                        COUNT(*) AS batch_count,
                        SUM(CAST(COALESCE(NULLIF(expected_check_amount,''),'0') AS REAL)) AS amount
                 FROM payment_tags
                 WHERE UPPER(COALESCE(payment_status,'')) = 'UNPAID'
-                  AND COALESCE({col}, '') <> ''
-                GROUP BY COALESCE({col}, '')
-                ORDER BY amount DESC, batch_count DESC, value ASC
-                LIMIT 500
-                """
+                  AND COALESCE(provider, '') <> ''
+                  {provider_filter}
+                GROUP BY provider, region, credit_term
+                ORDER BY amount DESC, batch_count DESC, provider ASC
+                LIMIT 300
+                """,
+                params,
             ).fetchall()
         return jsonify([dict(row) for row in rows])
 
-    @app.post("/api/bulk-preview")
-    def api_bulk_preview():
-        payload = request.get_json(force=True, silent=True) or {}
-        field = payload.get("field", "provider")
-        values = payload.get("values", [])
-        try:
-            where_sql, params = _bulk_where(field, values)
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
+    @app.get("/api/provider-batches")
+    def api_provider_batches():
+        provider = (request.args.get("provider") or "").strip()
+        if not provider:
+            return jsonify({"error": "Provider is required"}), 400
         with connect(db_path) as conn:
-            summary = conn.execute(
-                f"""
-                SELECT COUNT(*) AS batch_count,
-                       COUNT(DISTINCT provider) AS provider_count,
-                       SUM(CAST(COALESCE(NULLIF(expected_check_amount,''),'0') AS REAL)) AS amount
+            rows = conn.execute(
+                """
+                SELECT batch_no, provider, supplier_category_name, region, date_received, aging_bucket,
+                       credit_term, expected_check_amount, claims_amount, payment_priority,
+                       tagged_for_payment, target_payment_date, approval_status, payment_remarks,
+                       cv_no, check_no, check_date
                 FROM payment_tags
-                {where_sql}
+                WHERE provider = ?
+                  AND UPPER(COALESCE(payment_status,'')) = 'UNPAID'
+                ORDER BY
+                    CASE
+                        WHEN aging_bucket LIKE '%ABOVE 120%' THEN 1
+                        WHEN aging_bucket LIKE '%91-120%' THEN 2
+                        WHEN aging_bucket LIKE '%61-90%' THEN 3
+                        WHEN aging_bucket LIKE '%31-60%' THEN 4
+                        ELSE 5
+                    END,
+                    date_received ASC,
+                    CAST(COALESCE(NULLIF(expected_check_amount,''),'0') AS REAL) DESC
                 """,
-                params,
-            ).fetchone()
-            top = conn.execute(
-                f"""
-                SELECT provider,
-                       COUNT(*) AS batch_count,
-                       SUM(CAST(COALESCE(NULLIF(expected_check_amount,''),'0') AS REAL)) AS amount
-                FROM payment_tags
-                {where_sql}
-                GROUP BY provider
-                ORDER BY amount DESC
-                LIMIT 10
-                """,
-                params,
+                (provider,),
             ).fetchall()
-        return jsonify({"summary": dict(summary), "top_providers": [dict(row) for row in top]})
+        return jsonify([dict(row) for row in rows])
 
-    @app.post("/api/bulk-apply")
-    def api_bulk_apply():
+    @app.post("/api/schedule-selected")
+    def api_schedule_selected():
         payload = request.get_json(force=True, silent=True) or {}
-        field = payload.get("field", "provider")
-        values = payload.get("values", [])
+        batch_numbers = [str(x).strip() for x in payload.get("batch_numbers", []) if str(x).strip()]
+        if not batch_numbers:
+            return jsonify({"error": "No batches selected"}), 400
+        target_payment_date = str(payload.get("target_payment_date", "") or "").strip()
+        if not target_payment_date:
+            return jsonify({"error": "Target payment date is required"}), 400
         update_values = {
             "tagged_for_payment": "YES",
-            "target_payment_date": payload.get("target_payment_date", ""),
-            "payment_priority": payload.get("payment_priority", ""),
+            "target_payment_date": target_payment_date,
+            "payment_priority": payload.get("payment_priority", "HIGH"),
             "approval_status": payload.get("approval_status", ""),
             "payment_remarks": payload.get("payment_remarks", ""),
             "tagged_date": datetime.now().strftime("%Y-%m-%d"),
         }
-        try:
-            where_sql, params = _bulk_where(field, values)
-        except ValueError as exc:
-            return jsonify({"error": str(exc)}), 400
+        updated = 0
         with connect(db_path) as conn:
-            batch_rows = conn.execute(f"SELECT batch_no, provider FROM payment_tags {where_sql}", params).fetchall()
-        for row in batch_rows:
-            upsert_tag(row["batch_no"], {**update_values, "provider": row["provider"]}, db_path=db_path, actor="bulk_schedule")
-        return jsonify({"updated_rows": len(batch_rows)})
+            rows = conn.execute(
+                f"SELECT batch_no, provider FROM payment_tags WHERE batch_no IN ({','.join(['?'] * len(batch_numbers))})",
+                batch_numbers,
+            ).fetchall()
+        for row in rows:
+            upsert_tag(row["batch_no"], {**update_values, "provider": row["provider"]}, db_path=db_path, actor="selected_batch_schedule")
+            updated += 1
+        return jsonify({"updated_rows": updated})
 
     @app.post("/api/payments/<batch_no>")
     def api_update_payment(batch_no: str):
@@ -255,36 +244,39 @@ DASHBOARD_HTML = """
 header { background:#0f172a; color:#fff; padding:20px 26px; } header h1 { margin:0 0 5px; font-size:24px; } header p { margin:0; color:#cbd5e1; font-size:13px; }
 main { padding:18px; } .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px; box-shadow:0 1px 3px rgba(15,23,42,.08); margin-bottom:14px; }
 .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; } .metric-label { color:var(--muted); font-size:12px; margin-bottom:7px; } .metric-value { font-size:23px; font-weight:800; }
-.toolbar,.bulk-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(175px,1fr)); gap:10px; align-items:end; } label { display:block; color:var(--muted); font-size:12px; margin-bottom:5px; }
+.toolbar,.schedule-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(175px,1fr)); gap:10px; align-items:end; } label { display:block; color:var(--muted); font-size:12px; margin-bottom:5px; }
 input,select,textarea { width:100%; padding:8px 9px; border:1px solid var(--border); border-radius:8px; background:white; font-family:inherit; font-size:12px; }
 button { border:1px solid var(--border); background:white; padding:9px 11px; border-radius:9px; cursor:pointer; font-weight:700; font-size:12px; } button.primary { background:var(--primary); color:white; border-color:var(--primary); } button.good { background:var(--good); color:white; border-color:var(--good); }
-.note { color:var(--muted); font-size:12px; } .drilldown { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:8px; max-height:260px; overflow:auto; margin-top:10px; }
-.check-item { display:flex; gap:8px; align-items:flex-start; padding:8px; border:1px solid var(--border); border-radius:8px; background:#f8fafc; font-size:12px; } .check-item span { overflow-wrap:anywhere; }
-.preview { margin-top:10px; padding:10px; border-radius:10px; background:#f8fafc; border:1px solid var(--border); }
-.table-wrap { overflow:auto; max-height:68vh; border:1px solid var(--border); border-radius:12px; background:white; } table { border-collapse:collapse; width:100%; min-width:1500px; font-size:11px; table-layout:fixed; }
+.note { color:var(--muted); font-size:12px; } .split { display:grid; grid-template-columns:360px minmax(0,1fr); gap:12px; margin-top:12px; }
+.provider-list { max-height:420px; overflow:auto; border:1px solid var(--border); border-radius:12px; background:#fff; } .provider-item { width:100%; text-align:left; border:0; border-bottom:1px solid var(--border); border-radius:0; background:#fff; padding:10px; font-weight:400; } .provider-item.active { background:#dbeafe; }
+.batch-table-wrap { overflow:auto; max-height:420px; border:1px solid var(--border); border-radius:12px; background:white; } .batch-table { min-width:1050px; }
+.table-wrap { overflow:auto; max-height:68vh; border:1px solid var(--border); border-radius:12px; background:white; } table { border-collapse:collapse; width:100%; min-width:1450px; font-size:11px; table-layout:fixed; }
 th,td { border-bottom:1px solid var(--border); padding:7px 8px; text-align:left; vertical-align:top; white-space:normal; overflow-wrap:anywhere; word-break:break-word; line-height:1.25; } th { position:sticky; top:0; background:#f8fafc; z-index:1; font-size:11px; } tr:hover td { background:#f9fafb; }
-.controls-cell { width:150px; } .control-stack { display:grid; grid-template-columns:1fr; gap:5px; } .col-batch { width:145px; } .col-provider { width:230px; } .col-category { width:135px; } .col-region { width:80px; } .col-date { width:105px; } .col-aging { width:90px; } .col-term { width:90px; } .col-money { width:115px; text-align:right; } .col-priority { width:90px; } .col-status { width:95px; } .col-remarks { width:190px; }
+.controls-cell { width:145px; } .control-stack { display:grid; grid-template-columns:1fr; gap:5px; } .col-batch { width:145px; } .col-provider { width:230px; } .col-category { width:135px; } .col-region { width:80px; } .col-date { width:105px; } .col-aging { width:90px; } .col-term { width:90px; } .col-money { width:115px; text-align:right; } .col-priority { width:90px; } .col-status { width:95px; } .col-remarks { width:190px; }
 .badge { display:inline-block; padding:3px 6px; border-radius:6px; font-size:10px; font-weight:800; } .priority-urgent { background:#fee2e2; color:var(--danger); } .priority-high { background:#ffedd5; color:var(--warn); } .priority-normal { background:#e0f2fe; color:#0369a1; } .priority-low { background:#ecfdf5; color:var(--good); }
-.pagination { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px; }
+.pagination { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:10px; } @media(max-width:1000px){.split{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
-<header><h1>Claims Payment Workflow</h1><p>Bulk scheduling by Provider, Date Received, or Region. Source: data/payments.db</p></header>
+<header><h1>Claims Payment Workflow</h1><p>Provider drilldown scheduling: choose provider, tick specific batches, then schedule only selected batches.</p></header>
 <main>
 <section class="grid" id="metrics"></section>
 <section class="card">
-<h3>Bulk Payment Scheduling</h3>
-<div class="bulk-grid">
-<div><label>Schedule By</label><select id="bulkField" onchange="loadBulkValues()"><option value="provider">Provider Name</option><option value="date_received">Date Received</option><option value="region">Region</option></select></div>
+<h3>Provider Batch Scheduling</h3>
+<div class="schedule-grid">
+<div><label>Search Provider</label><input id="providerSearch" placeholder="Type provider name..." /></div>
 <div><label>Target Payment Date</label><input id="bulkTargetDate" type="date" /></div>
 <div><label>Priority</label><select id="bulkPriority"><option value="HIGH">HIGH</option><option value="URGENT">URGENT</option><option value="NORMAL">NORMAL</option><option value="LOW">LOW</option></select></div>
 <div><label>Approval</label><select id="bulkApproval"><option value="">No Approval Yet</option><option value="APPROVED">APPROVED</option><option value="HOLD">HOLD</option></select></div>
 <div><label>Remarks</label><input id="bulkRemarks" placeholder="Payment batch remarks" /></div>
-<div><button class="primary" onclick="previewBulk()">Preview Matching Batches</button></div>
-<div><button class="good" onclick="applyBulk()">Apply To Selected Batches</button></div>
+<div><button class="primary" onclick="loadProviders()">Load Providers</button></div>
+<div><button class="good" onclick="scheduleCheckedBatches()">Schedule Checked Batches</button></div>
 </div>
-<div id="bulkValues" class="drilldown"></div>
-<div id="bulkPreview" class="preview note">Select drilldown values, then preview.</div>
+<div id="selectionSummary" class="note" style="margin-top:10px">Select a provider to view unpaid batches.</div>
+<div class="split">
+<div><div class="note" style="margin-bottom:6px">Providers with unpaid batches</div><div id="providerList" class="provider-list"></div></div>
+<div><div class="note" style="margin-bottom:6px">Unpaid batches under selected provider</div><div id="providerBatchWrap" class="batch-table-wrap"></div></div>
+</div>
 </section>
 <section class="card">
 <div class="toolbar">
@@ -297,29 +289,32 @@ th,td { border-bottom:1px solid var(--border); padding:7px 8px; text-align:left;
 <div><button class="primary" onclick="loadRows()">Refresh</button></div>
 <div><button class="good" onclick="window.location.href='/export/payments.csv'">Export DB CSV</button></div>
 </div>
-<p class="note">This optimized view uses server-side pagination. Only the current page is loaded from SQLite.</p>
+<p class="note">Below is the paginated database view. Scheduling should be done using the provider batch drilldown above.</p>
 </section>
 <section class="card"><div id="tableNote" class="note"></div><div class="table-wrap" id="tableWrap"></div><div class="pagination" id="pagination"></div></section>
 </main>
 <script>
-let ROWS = []; let totalRows = 0; let currentPage = 1; let pageSize = 100; let loading = false;
+let ROWS = []; let totalRows = 0; let currentPage = 1; let pageSize = 100; let loading = false; let selectedProvider = ''; let providerBatches = [];
 function num(v) { const n = Number(String(v ?? '').replaceAll(',', '')); return Number.isNaN(n) ? 0 : n; }
 function money(v) { return num(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}); }
 function escapeHtml(v) { return String(v ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;'); }
 function upper(v) { return String(v ?? '').trim().toUpperCase(); }
 function priorityClass(v) { const p = upper(v || 'NORMAL').toLowerCase(); return `priority-${p}`; }
-function selectedBulkValues() { return [...document.querySelectorAll('.bulk-check:checked')].map(x => x.value); }
+function checkedBatchNumbers() { return [...document.querySelectorAll('.batch-check:checked')].map(x => x.value); }
 function params() { const p = new URLSearchParams(); p.set('page', currentPage); p.set('page_size', pageSize); p.set('q', document.getElementById('search').value || ''); p.set('tag_status', document.getElementById('tagStatus').value); p.set('priority', document.getElementById('priorityFilter').value); p.set('approval', document.getElementById('approvalFilter').value); p.set('date_from', document.getElementById('dateFrom').value || ''); p.set('date_to', document.getElementById('dateTo').value || ''); return p; }
-async function loadBulkValues() { const field = document.getElementById('bulkField').value; const res = await fetch('/api/bulk-values?field=' + encodeURIComponent(field)); const rows = await res.json(); document.getElementById('bulkValues').innerHTML = rows.map(r => `<label class="check-item"><input class="bulk-check" type="checkbox" value="${escapeHtml(r.value)}" /><span><b>${escapeHtml(r.value)}</b><br>${Number(r.batch_count||0).toLocaleString()} batches | ${money(r.amount||0)}</span></label>`).join(''); document.getElementById('bulkPreview').textContent = 'Select drilldown values, then preview.'; }
-async function previewBulk() { const values = selectedBulkValues(); const field = document.getElementById('bulkField').value; if (!values.length) { alert('Select at least one value.'); return; } const res = await fetch('/api/bulk-preview', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({field, values})}); const data = await res.json(); if (data.error) { alert(data.error); return; } const s = data.summary || {}; const top = (data.top_providers || []).map(x => `${escapeHtml(x.provider)} - ${Number(x.batch_count||0).toLocaleString()} batches - ${money(x.amount||0)}`).join('<br>'); document.getElementById('bulkPreview').innerHTML = `<b>Preview:</b> ${Number(s.batch_count||0).toLocaleString()} batches | ${Number(s.provider_count||0).toLocaleString()} providers | ${money(s.amount||0)}<br><br><b>Top Providers</b><br>${top}`; }
-async function applyBulk() { const values = selectedBulkValues(); if (!values.length) { alert('Select at least one value.'); return; } if (!document.getElementById('bulkTargetDate').value) { alert('Select a target payment date.'); return; } if (!confirm('Apply payment schedule to all matching unpaid batches?')) return; const payload = {field: document.getElementById('bulkField').value, values, target_payment_date: document.getElementById('bulkTargetDate').value, payment_priority: document.getElementById('bulkPriority').value, approval_status: document.getElementById('bulkApproval').value, payment_remarks: document.getElementById('bulkRemarks').value}; const res = await fetch('/api/bulk-apply', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); const data = await res.json(); if (data.error) { alert(data.error); return; } alert(`Updated ${Number(data.updated_rows||0).toLocaleString()} batches.`); await previewBulk(); await loadRows(true); }
+async function loadProviders() { const q = document.getElementById('providerSearch').value || ''; const res = await fetch('/api/providers?q=' + encodeURIComponent(q)); const rows = await res.json(); document.getElementById('providerList').innerHTML = rows.map(r => `<button class="provider-item ${r.provider===selectedProvider?'active':''}" onclick="selectProvider('${escapeHtml(r.provider)}')"><b>${escapeHtml(r.provider)}</b><br><span class="note">${escapeHtml(r.region||'')} | ${escapeHtml(r.credit_term||'')} | ${Number(r.batch_count||0).toLocaleString()} batches | ${money(r.amount||0)}</span></button>`).join(''); }
+async function selectProvider(provider) { selectedProvider = provider; await loadProviders(); const res = await fetch('/api/provider-batches?provider=' + encodeURIComponent(provider)); providerBatches = await res.json(); renderProviderBatches(); }
+function updateSelectionSummary() { const selected = checkedBatchNumbers(); const amount = providerBatches.filter(r => selected.includes(String(r.batch_no))).reduce((a,r)=>a+num(r.expected_check_amount),0); document.getElementById('selectionSummary').textContent = `Selected Provider: ${selectedProvider || 'None'} | Selected Batches: ${selected.length.toLocaleString()} | Selected Amount: ${money(amount)}`; }
+function renderProviderBatches() { if (!providerBatches.length) { document.getElementById('providerBatchWrap').innerHTML = '<div style="padding:14px" class="note">No unpaid batches found.</div>'; updateSelectionSummary(); return; } const header = `<thead><tr><th style="width:42px"><input type="checkbox" onchange="toggleAllBatches(this.checked)" /></th><th>Batch No</th><th>Date Received</th><th>Aging</th><th>Credit Term</th><th>Expected Check</th><th>Current Tag</th><th>Target Payment</th></tr></thead>`; const body = `<tbody>${providerBatches.map(r => `<tr><td><input class="batch-check" type="checkbox" value="${escapeHtml(r.batch_no)}" onchange="updateSelectionSummary()" /></td><td>${escapeHtml(r.batch_no)}</td><td>${escapeHtml(r.date_received)}</td><td>${escapeHtml(r.aging_bucket)}</td><td>${escapeHtml(r.credit_term)}</td><td class="col-money">${money(r.expected_check_amount)}</td><td>${escapeHtml(r.tagged_for_payment || 'Not Tagged')}</td><td>${escapeHtml(r.target_payment_date || '')}</td></tr>`).join('')}</tbody>`; document.getElementById('providerBatchWrap').innerHTML = `<table class="batch-table">${header}${body}</table>`; updateSelectionSummary(); }
+function toggleAllBatches(checked) { document.querySelectorAll('.batch-check').forEach(x => x.checked = checked); updateSelectionSummary(); }
+async function scheduleCheckedBatches() { const batch_numbers = checkedBatchNumbers(); if (!batch_numbers.length) { alert('Select at least one batch.'); return; } if (!document.getElementById('bulkTargetDate').value) { alert('Select a target payment date.'); return; } if (!confirm(`Schedule ${batch_numbers.length.toLocaleString()} selected batches for payment?`)) return; const payload = { batch_numbers, target_payment_date: document.getElementById('bulkTargetDate').value, payment_priority: document.getElementById('bulkPriority').value, approval_status: document.getElementById('bulkApproval').value, payment_remarks: document.getElementById('bulkRemarks').value }; const res = await fetch('/api/schedule-selected', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}); const data = await res.json(); if (data.error) { alert(data.error); return; } alert(`Scheduled ${Number(data.updated_rows||0).toLocaleString()} selected batches.`); await selectProvider(selectedProvider); await loadRows(true); }
 async function loadRows(reset=false) { if (loading) return; if (reset) currentPage = 1; loading = true; document.getElementById('tableNote').textContent = 'Loading...'; const response = await fetch('/api/payments?' + params().toString()); const payload = await response.json(); ROWS = payload.rows || []; totalRows = payload.total || 0; currentPage = payload.page || currentPage; pageSize = payload.page_size || pageSize; renderMetrics(payload.metrics || {}); renderTable(); loading = false; }
 function renderMetrics(m) { const metrics = [['Payment Candidates', Number(m.candidates || 0).toLocaleString()], ['Tagged', Number(m.tagged || 0).toLocaleString()], ['Approved', Number(m.approved || 0).toLocaleString()], ['Urgent / High', Number(m.urgent_high || 0).toLocaleString()], ['Filtered Amount', money(m.filtered_amount || 0)], ['Tagged Amount', money(m.tagged_amount || 0)]]; document.getElementById('metrics').innerHTML = metrics.map(([l,v]) => `<div class="card"><div class="metric-label">${l}</div><div class="metric-value">${v}</div></div>`).join(''); }
 function renderTable() { const totalPages = Math.max(1, Math.ceil(totalRows / pageSize)); document.getElementById('tableNote').textContent = `Showing ${ROWS.length.toLocaleString()} rows on this page. Filtered rows: ${totalRows.toLocaleString()}.`; if (!ROWS.length) { document.getElementById('tableWrap').innerHTML = '<div style="padding:16px" class="note">No rows found.</div>'; return; } const header = `<thead><tr>${['Controls','Batch No','Provider','Supplier Category','Region','Date Received','Aging','Credit Term','Claim Amount','Expected Check','Priority','Tag Status','Target Payment','Approval','Remarks'].map(h => `<th>${h}</th>`).join('')}</tr></thead>`; const body = `<tbody>${ROWS.map(renderRow).join('')}</tbody>`; document.getElementById('tableWrap').innerHTML = `<table>${header}${body}</table>`; document.getElementById('pagination').innerHTML = `<button onclick="firstPage()" ${currentPage<=1?'disabled':''}>First</button><button onclick="prevPage()" ${currentPage<=1?'disabled':''}>Previous</button><span class="note">Page ${currentPage.toLocaleString()} of ${totalPages.toLocaleString()}</span><button onclick="nextPage()" ${currentPage>=totalPages?'disabled':''}>Next</button><button onclick="lastPage()" ${currentPage>=totalPages?'disabled':''}>Last</button><select onchange="pageSize=Number(this.value);currentPage=1;loadRows()"><option value="50" ${pageSize==50?'selected':''}>50</option><option value="100" ${pageSize==100?'selected':''}>100</option><option value="250" ${pageSize==250?'selected':''}>250</option><option value="500" ${pageSize==500?'selected':''}>500</option></select>`; }
 function renderRow(row) { const key = escapeHtml(row.batch_no); const p = upper(row.payment_priority || 'NORMAL') || 'NORMAL'; return `<tr><td class="controls-cell"><div class="control-stack"><select onchange="updateRow('${key}','tagged_for_payment',this.value)"><option value="" ${!row.tagged_for_payment?'selected':''}>Not Tagged</option><option value="YES" ${upper(row.tagged_for_payment)==='YES'?'selected':''}>YES</option></select><select onchange="updateRow('${key}','payment_priority',this.value)"><option value="URGENT" ${p==='URGENT'?'selected':''}>URGENT</option><option value="HIGH" ${p==='HIGH'?'selected':''}>HIGH</option><option value="NORMAL" ${p==='NORMAL'?'selected':''}>NORMAL</option><option value="LOW" ${p==='LOW'?'selected':''}>LOW</option></select></div></td><td class="col-batch">${escapeHtml(row.batch_no)}</td><td class="col-provider">${escapeHtml(row.provider)}</td><td class="col-category">${escapeHtml(row.supplier_category_name)}</td><td class="col-region">${escapeHtml(row.region)}</td><td class="col-date">${escapeHtml(row.date_received)}</td><td class="col-aging">${escapeHtml(row.aging_bucket)}</td><td class="col-term">${escapeHtml(row.credit_term)}</td><td class="col-money">${money(row.claims_amount)}</td><td class="col-money">${money(row.expected_check_amount)}</td><td class="col-priority"><span class="badge ${priorityClass(p)}">${escapeHtml(p)}</span></td><td class="col-status">${escapeHtml(row.tagged_for_payment || 'Not Tagged')}</td><td class="col-date"><input type="date" value="${escapeHtml(row.target_payment_date)}" onchange="updateRow('${key}','target_payment_date',this.value)" /></td><td class="col-status"><select onchange="updateRow('${key}','approval_status',this.value)"><option value="" ${!row.approval_status?'selected':''}>Select</option><option value="APPROVED" ${upper(row.approval_status)==='APPROVED'?'selected':''}>APPROVED</option><option value="HOLD" ${upper(row.approval_status)==='HOLD'?'selected':''}>HOLD</option></select></td><td class="col-remarks"><textarea rows="2" onchange="updateRow('${key}','payment_remarks',this.value)">${escapeHtml(row.payment_remarks)}</textarea></td></tr>`; }
 async function updateRow(batchNo, field, value) { const row = ROWS.find(r => String(r.batch_no) === String(batchNo)); const payload = { actor: 'manual_update', provider: row?.provider || '', [field]: value }; if (field === 'tagged_for_payment' && value === 'YES') payload.tagged_date = new Date().toISOString().slice(0,10); await fetch(`/api/payments/${encodeURIComponent(batchNo)}`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) }); }
 function nextPage() { currentPage++; loadRows(); } function prevPage() { currentPage--; loadRows(); } function firstPage() { currentPage = 1; loadRows(); } function lastPage() { currentPage = Math.max(1, Math.ceil(totalRows / pageSize)); loadRows(); }
-let timer = null; ['search','tagStatus','priorityFilter','approvalFilter','dateFrom','dateTo'].forEach(id => document.getElementById(id).addEventListener('input', () => { clearTimeout(timer); timer=setTimeout(() => loadRows(true), 250); })); loadBulkValues(); loadRows();
+let timer = null; ['search','tagStatus','priorityFilter','approvalFilter','dateFrom','dateTo'].forEach(id => document.getElementById(id).addEventListener('input', () => { clearTimeout(timer); timer=setTimeout(() => loadRows(true), 250); })); document.getElementById('providerSearch').addEventListener('input', () => { clearTimeout(timer); timer=setTimeout(loadProviders, 300); }); loadProviders(); loadRows();
 </script>
 </body>
 </html>
