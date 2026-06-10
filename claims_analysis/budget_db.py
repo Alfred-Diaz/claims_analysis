@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import calendar
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,6 @@ CREATE TABLE IF NOT EXISTS budget_months (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE TABLE IF NOT EXISTS budget_weeks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     budget_month TEXT NOT NULL,
@@ -33,7 +32,6 @@ CREATE TABLE IF NOT EXISTS budget_weeks (
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(budget_month, week_no)
 );
-
 CREATE TABLE IF NOT EXISTS weekly_budget_adjustments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     budget_month TEXT NOT NULL,
@@ -43,7 +41,6 @@ CREATE TABLE IF NOT EXISTS weekly_budget_adjustments (
     created_by TEXT DEFAULT '',
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE TABLE IF NOT EXISTS monthly_budget_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     budget_month TEXT NOT NULL,
@@ -86,27 +83,37 @@ def month_key_from_date(value: str | date | None = None) -> str:
 
 
 def calendar_weeks_for_month(budget_month: str) -> list[tuple[int, date, date]]:
+    """Fixed four budget weeks: 1-7, 8-14, 15-21, 22-end of month."""
     year, month = [int(x) for x in budget_month.split("-")]
-    first = date(year, month, 1)
-    last = date(year, month, calendar.monthrange(year, month)[1])
-    weeks: list[tuple[int, date, date]] = []
-    current = first
-    week_no = 1
-    while current <= last:
-        days_until_sunday = 6 - current.weekday()
-        week_end = min(current + timedelta(days=days_until_sunday), last)
-        weeks.append((week_no, current, week_end))
-        current = week_end + timedelta(days=1)
-        week_no += 1
-    return weeks
+    last_day = calendar.monthrange(year, month)[1]
+    ranges = [(1, 7), (8, 14), (15, 21), (22, last_day)]
+    return [(i + 1, date(year, month, start), date(year, month, end)) for i, (start, end) in enumerate(ranges)]
+
+
+def _claim_amount_expr() -> str:
+    return "CAST(COALESCE(NULLIF(claims_amount,''),'0') AS REAL)"
+
+
+def _rebuild_four_weeks_if_needed(conn: sqlite3.Connection, budget_month: str, total_budget: float, now: str) -> None:
+    existing = conn.execute("SELECT COUNT(*) AS c FROM budget_weeks WHERE budget_month = ?", (budget_month,)).fetchone()["c"]
+    if existing == 4:
+        return
+    conn.execute("DELETE FROM budget_weeks WHERE budget_month = ?", (budget_month,))
+    weekly_amount = total_budget / 4
+    for week_no, week_start, week_end in calendar_weeks_for_month(budget_month):
+        conn.execute(
+            """
+            INSERT INTO budget_weeks (budget_month, week_no, week_start, week_end, allocated_budget, used_budget, remaining_budget, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+            """,
+            (budget_month, week_no, week_start.isoformat(), week_end.isoformat(), weekly_amount, weekly_amount, now, now),
+        )
 
 
 def ensure_month(budget_month: str | None = None, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
     init_budget_db(db_path)
     budget_month = budget_month or month_key_from_date()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    weeks = calendar_weeks_for_month(budget_month)
-    weekly_amount = DEFAULT_MONTHLY_BUDGET / len(weeks)
     with connect(db_path) as conn:
         month = conn.execute("SELECT * FROM budget_months WHERE budget_month = ?", (budget_month,)).fetchone()
         if not month:
@@ -117,21 +124,13 @@ def ensure_month(budget_month: str | None = None, db_path: str | Path = DEFAULT_
                 """,
                 (budget_month, DEFAULT_MONTHLY_BUDGET, DEFAULT_MONTHLY_BUDGET, now, now),
             )
-            for week_no, week_start, week_end in weeks:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO budget_weeks (budget_month, week_no, week_start, week_end, allocated_budget, used_budget, remaining_budget, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
-                    """,
-                    (budget_month, week_no, week_start.isoformat(), week_end.isoformat(), weekly_amount, weekly_amount, now, now),
-                )
+            total_budget = DEFAULT_MONTHLY_BUDGET
+        else:
+            total_budget = float(month["total_monthly_budget"] or DEFAULT_MONTHLY_BUDGET)
+        _rebuild_four_weeks_if_needed(conn, budget_month, total_budget, now)
         conn.commit()
     refresh_week_usage(budget_month, db_path)
     return get_month_summary(budget_month, db_path)
-
-
-def _claim_amount_expr() -> str:
-    return "CAST(COALESCE(NULLIF(claims_amount,''),'0') AS REAL)"
 
 
 def refresh_week_usage(budget_month: str, db_path: str | Path = DEFAULT_DB_PATH) -> None:
@@ -149,23 +148,22 @@ def refresh_week_usage(budget_month: str, db_path: str | Path = DEFAULT_DB_PATH)
                 (week["week_start"], week["week_end"]),
             ).fetchone()["used_budget"] or 0
             remaining = float(week["allocated_budget"] or 0) - float(used or 0)
-            conn.execute(
-                "UPDATE budget_weeks SET used_budget = ?, remaining_budget = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (used, remaining, week["id"]),
-            )
+            conn.execute("UPDATE budget_weeks SET used_budget = ?, remaining_budget = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (used, remaining, week["id"]))
         conn.commit()
 
 
 def get_month_summary(budget_month: str | None = None, db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
     budget_month = budget_month or month_key_from_date()
     init_budget_db(db_path)
+    with connect(db_path) as conn:
+        month = conn.execute("SELECT * FROM budget_months WHERE budget_month = ?", (budget_month,)).fetchone()
+        if not month:
+            return ensure_month(budget_month, db_path)
     refresh_week_usage(budget_month, db_path)
     with connect(db_path) as conn:
         month = conn.execute("SELECT * FROM budget_months WHERE budget_month = ?", (budget_month,)).fetchone()
         weeks = conn.execute("SELECT * FROM budget_weeks WHERE budget_month = ? ORDER BY week_no", (budget_month,)).fetchall()
         requests = conn.execute("SELECT * FROM monthly_budget_requests WHERE budget_month = ? ORDER BY requested_at DESC", (budget_month,)).fetchall()
-    if not month:
-        return ensure_month(budget_month, db_path)
     return {"month": dict(month), "weeks": [dict(row) for row in weeks], "requests": [dict(row) for row in requests]}
 
 
@@ -174,30 +172,21 @@ def request_weekly_additional_funds(budget_month: str, target_week_no: int, addi
     additional_amount = float(additional_amount or 0)
     if additional_amount <= 0:
         raise ValueError("additional_amount must be greater than zero")
+    if int(target_week_no) not in {1, 2, 3, 4}:
+        raise ValueError("Week number must be 1, 2, 3, or 4")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with connect(db_path) as conn:
         weeks = conn.execute("SELECT * FROM budget_weeks WHERE budget_month = ? ORDER BY week_no", (budget_month,)).fetchall()
-        target = [w for w in weeks if int(w["week_no"]) == int(target_week_no)]
-        remaining_weeks = [w for w in weeks if int(w["week_no"]) != int(target_week_no)]
-        if not target:
-            raise ValueError("Target week not found")
-        if not remaining_weeks:
-            raise ValueError("No other weeks available for reallocation")
-        deduction_each = additional_amount / len(remaining_weeks)
-        for week in remaining_weeks:
+        target = [w for w in weeks if int(w["week_no"]) == int(target_week_no)][0]
+        other_weeks = [w for w in weeks if int(w["week_no"]) != int(target_week_no)]
+        deduction_each = additional_amount / len(other_weeks)
+        for week in other_weeks:
             new_alloc = float(week["allocated_budget"] or 0) - deduction_each
             if new_alloc < 0:
                 raise ValueError("Additional amount is too high for even reallocation")
             conn.execute("UPDATE budget_weeks SET allocated_budget = ?, updated_at = ? WHERE id = ?", (new_alloc, now, week["id"]))
-        target_week = target[0]
-        conn.execute("UPDATE budget_weeks SET allocated_budget = ?, updated_at = ? WHERE id = ?", (float(target_week["allocated_budget"] or 0) + additional_amount, now, target_week["id"]))
-        conn.execute(
-            """
-            INSERT INTO weekly_budget_adjustments (budget_month, target_week_no, additional_amount, reason, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (budget_month, target_week_no, additional_amount, reason, created_by, now),
-        )
+        conn.execute("UPDATE budget_weeks SET allocated_budget = ?, updated_at = ? WHERE id = ?", (float(target["allocated_budget"] or 0) + additional_amount, now, target["id"]))
+        conn.execute("INSERT INTO weekly_budget_adjustments (budget_month, target_week_no, additional_amount, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)", (budget_month, target_week_no, additional_amount, reason, created_by, now))
         conn.commit()
     refresh_week_usage(budget_month, db_path)
     return get_month_summary(budget_month, db_path)
@@ -210,14 +199,11 @@ def create_monthly_budget_request(budget_month: str, requested_additional_amount
     if requested_additional_amount <= 0:
         raise ValueError("requested_additional_amount must be greater than zero")
     with connect(db_path) as conn:
-        conn.execute(
-            """
+        conn.execute("""
             INSERT INTO monthly_budget_requests
             (budget_month, current_monthly_budget, requested_additional_amount, requested_total_budget, reason, status, requested_by)
             VALUES (?, ?, ?, ?, ?, 'PENDING', ?)
-            """,
-            (budget_month, current, requested_additional_amount, current + requested_additional_amount, reason, requested_by),
-        )
+        """, (budget_month, current, requested_additional_amount, current + requested_additional_amount, reason, requested_by))
         conn.commit()
         row = conn.execute("SELECT * FROM monthly_budget_requests ORDER BY id DESC LIMIT 1").fetchone()
     return dict(row)
@@ -227,33 +213,31 @@ def approve_monthly_budget_request(request_id: int, approved_by: str = "Finance 
     init_budget_db(db_path)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with connect(db_path) as conn:
-        request = conn.execute("SELECT * FROM monthly_budget_requests WHERE id = ?", (request_id,)).fetchone()
-        if not request:
+        req = conn.execute("SELECT * FROM monthly_budget_requests WHERE id = ?", (request_id,)).fetchone()
+        if not req:
             raise ValueError("Budget request not found")
-        if request["status"] != "PENDING":
+        if req["status"] != "PENDING":
             raise ValueError("Only pending requests can be approved")
-        month = conn.execute("SELECT * FROM budget_months WHERE budget_month = ?", (request["budget_month"],)).fetchone()
-        additional = float(request["requested_additional_amount"] or 0)
+        month = conn.execute("SELECT * FROM budget_months WHERE budget_month = ?", (req["budget_month"],)).fetchone()
+        additional = float(req["requested_additional_amount"] or 0)
         new_approved = float(month["approved_additional_budget"] or 0) + additional
         new_total = float(month["base_monthly_budget"] or DEFAULT_MONTHLY_BUDGET) + new_approved
-        conn.execute("UPDATE budget_months SET approved_additional_budget = ?, total_monthly_budget = ?, updated_at = ? WHERE budget_month = ?", (new_approved, new_total, now, request["budget_month"]))
-        weeks = conn.execute("SELECT * FROM budget_weeks WHERE budget_month = ? ORDER BY week_no", (request["budget_month"],)).fetchall()
-        add_each = additional / len(weeks)
-        for week in weeks:
-            conn.execute("UPDATE budget_weeks SET allocated_budget = allocated_budget + ?, updated_at = ? WHERE id = ?", (add_each, now, week["id"]))
+        conn.execute("UPDATE budget_months SET approved_additional_budget = ?, total_monthly_budget = ?, updated_at = ? WHERE budget_month = ?", (new_approved, new_total, now, req["budget_month"]))
+        add_each = additional / 4
+        conn.execute("UPDATE budget_weeks SET allocated_budget = allocated_budget + ?, updated_at = ? WHERE budget_month = ?", (add_each, now, req["budget_month"]))
         conn.execute("UPDATE monthly_budget_requests SET status = 'APPROVED', approved_by = ?, approval_remarks = ?, approved_at = ? WHERE id = ?", (approved_by, approval_remarks, now, request_id))
         conn.commit()
-    refresh_week_usage(request["budget_month"], db_path)
-    return get_month_summary(request["budget_month"], db_path)
+    refresh_week_usage(req["budget_month"], db_path)
+    return get_month_summary(req["budget_month"], db_path)
 
 
 def reject_monthly_budget_request(request_id: int, approved_by: str = "Finance Manager", approval_remarks: str = "", db_path: str | Path = DEFAULT_DB_PATH) -> dict[str, Any]:
     init_budget_db(db_path)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with connect(db_path) as conn:
-        request = conn.execute("SELECT * FROM monthly_budget_requests WHERE id = ?", (request_id,)).fetchone()
-        if not request:
+        req = conn.execute("SELECT * FROM monthly_budget_requests WHERE id = ?", (request_id,)).fetchone()
+        if not req:
             raise ValueError("Budget request not found")
         conn.execute("UPDATE monthly_budget_requests SET status = 'REJECTED', approved_by = ?, approval_remarks = ?, approved_at = ? WHERE id = ?", (approved_by, approval_remarks, now, request_id))
         conn.commit()
-    return get_month_summary(request["budget_month"], db_path)
+    return get_month_summary(req["budget_month"], db_path)
