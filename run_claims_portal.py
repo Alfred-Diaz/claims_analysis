@@ -26,7 +26,6 @@ SERVER_URL = get_server_url()
 
 APPS = [
     ("Portal", [PYTHON, "-m", "claims_analysis.portal_app", "--host", HOST, "--port", "5049"], f"{SERVER_URL}:5049"),
-    ("Dashboard", [PYTHON, "-m", "streamlit", "run", "dashboard.py", "--server.address", HOST, "--server.port", "8501", "--server.headless", "true"], f"{SERVER_URL}:8501"),
     ("Payment Scheduling", [PYTHON, "-m", "claims_analysis.payment_app", "--host", HOST, "--port", "5050"], f"{SERVER_URL}:5050"),
     ("Budget Management", [PYTHON, "-m", "claims_analysis.budget_app", "--host", HOST, "--port", "5051"], f"{SERVER_URL}:5051"),
 ]
@@ -34,7 +33,7 @@ APPS = [
 
 def main() -> None:
     processes: list[tuple[str, subprocess.Popen]] = []
-    print("Starting Claims Analysis Portal environment in NETWORK MODE...")
+    print("Starting Claims Analysis HTML Portal environment in NETWORK MODE...")
     print("Press CTRL+C in this window to stop all apps.\n")
 
     try:
@@ -45,8 +44,7 @@ def main() -> None:
             time.sleep(1.2)
 
         print("\nAll apps started.")
-        print(f"Portal: {SERVER_URL}:5049")
-        print(f"Dashboard: {SERVER_URL}:8501")
+        print(f"Portal / Dashboard: {SERVER_URL}:5049")
         print(f"Payment Scheduling: {SERVER_URL}:5050")
         print(f"Budget Management: {SERVER_URL}:5051\n")
         print("Users should open the Portal URL in their browser.")
@@ -58,7 +56,7 @@ def main() -> None:
                 if process.poll() is not None:
                     print(f"WARNING: {name} stopped with code {process.returncode}")
     except KeyboardInterrupt:
-        print("\nStopping Claims Analysis Portal environment...")
+        print("\nStopping Claims Analysis HTML Portal environment...")
         for name, process in processes:
             if process.poll() is None:
                 print(f"Stopping {name}...")
