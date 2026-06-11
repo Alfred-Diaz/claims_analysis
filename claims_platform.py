@@ -6,6 +6,14 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from claims_analysis.budget_db import (
+    approve_monthly_budget_request,
+    create_monthly_budget_request,
+    ensure_month,
+    month_key_from_date,
+    reject_monthly_budget_request,
+    request_weekly_additional_funds,
+)
 from claims_analysis.payment_db import DEFAULT_DB_PATH, connect, init_db, upsert_tag
 
 st.set_page_config(page_title="Claims Analysis Platform", layout="wide")
@@ -181,6 +189,7 @@ def schedule_selected(batch_numbers: list[str], target_date: str, priority: str,
     }
     for row in rows:
         upsert_tag(row["batch_no"], {**values, "provider": row["provider"]}, db_path=DB_PATH, actor="claims_platform")
+    ensure_month(month_key_from_date(target_date), DB_PATH)
     return True, f"Scheduled {len(rows):,} selected batches."
 
 
@@ -189,7 +198,8 @@ def unschedule_selected(batch_numbers: list[str]) -> tuple[bool, str]:
         return False, "Select at least one scheduled batch."
     placeholders = ",".join(["?"] * len(batch_numbers))
     with connect(DB_PATH) as conn:
-        rows = conn.execute(f"SELECT batch_no, provider FROM payment_tags WHERE batch_no IN ({placeholders})", batch_numbers).fetchall()
+        rows = conn.execute(f"SELECT batch_no, provider, target_payment_date FROM payment_tags WHERE batch_no IN ({placeholders})", batch_numbers).fetchall()
+    affected_months = {month_key_from_date(row["target_payment_date"]) for row in rows if row["target_payment_date"]}
     for row in rows:
         upsert_tag(
             row["batch_no"],
@@ -197,6 +207,8 @@ def unschedule_selected(batch_numbers: list[str]) -> tuple[bool, str]:
             db_path=DB_PATH,
             actor="claims_platform",
         )
+    for month in affected_months:
+        ensure_month(month, DB_PATH)
     return True, f"Returned {len(rows):,} batches to For Scheduling."
 
 
@@ -287,9 +299,108 @@ def payment_page() -> None:
 
 def budget_page() -> None:
     st.title("Budget Management")
-    st.caption("Streamlit redesign shell. Full weekly/monthly controls will be migrated here in Phase 3.")
-    st.info("Budget controls are next. Use the existing Budget Management app while this module is migrated.")
-    st.markdown("Open existing app: [Budget Management](http://127.0.0.1:5051)")
+    st.caption("Monthly budget, fixed 4-week allocation, weekly reallocation, and Finance Manager approval.")
+
+    month = st.text_input("Budget Month", value=month_key_from_date(), help="Use YYYY-MM format")
+    data = ensure_month(month, DB_PATH)
+    month_data = data["month"]
+    weeks = pd.DataFrame(data["weeks"])
+    requests = pd.DataFrame(data["requests"])
+
+    total_used = float(weeks["used_budget"].astype(float).sum()) if not weeks.empty else 0.0
+    total_remaining = float(weeks["remaining_budget"].astype(float).sum()) if not weeks.empty else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Base Monthly Budget", money(month_data.get("base_monthly_budget")))
+    c2.metric("Approved Additional", money(month_data.get("approved_additional_budget")))
+    c3.metric("Total Budget", money(month_data.get("total_monthly_budget")))
+    c4.metric("Used / Scheduled", money(total_used))
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Remaining", money(total_remaining))
+    c6.metric("Budget Weeks", f"{len(weeks):,}")
+    c7.metric("Pending Requests", f"{0 if requests.empty else len(requests[requests['status'] == 'PENDING']):,}")
+    utilization = (total_used / float(month_data.get("total_monthly_budget") or 1)) * 100
+    c8.metric("Utilization", f"{utilization:.2f}%")
+
+    tab_weeks, tab_reallocate, tab_request, tab_approval = st.tabs([
+        "Weekly Allocation",
+        "Weekly Reallocation",
+        "Monthly Request",
+        "Approval Queue",
+    ])
+
+    with tab_weeks:
+        st.subheader("Fixed 4-Week Budget Allocation")
+        if weeks.empty:
+            st.info("No weekly allocation found.")
+        else:
+            display_weeks = weeks.copy()
+            for col in ["allocated_budget", "used_budget", "remaining_budget"]:
+                display_weeks[col] = display_weeks[col].astype(float)
+            st.dataframe(display_weeks, use_container_width=True, height=300)
+            chart_df = display_weeks[["week_no", "allocated_budget", "used_budget", "remaining_budget"]].set_index("week_no")
+            st.bar_chart(chart_df)
+
+    with tab_reallocate:
+        st.subheader("Request Additional Weekly Funds")
+        st.caption("This does not increase the monthly budget. It adds funds to one week and deducts evenly from the other three weeks.")
+        with st.form("weekly_reallocation_form"):
+            f1, f2 = st.columns(2)
+            week_no = f1.selectbox("Target Week", [1, 2, 3, 4])
+            amount = f2.number_input("Additional Amount", min_value=0.0, step=100000.0)
+            reason = st.text_input("Reason")
+            submitted = st.form_submit_button("Apply Weekly Reallocation", type="primary")
+            if submitted:
+                try:
+                    request_weekly_additional_funds(month, week_no, amount, reason, "Claims Manager", DB_PATH)
+                    st.success("Weekly budget reallocated successfully.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+    with tab_request:
+        st.subheader("Monthly Additional Funds Request")
+        st.caption("This creates a pending request. It only affects the budget after Finance Manager approval.")
+        with st.form("monthly_request_form"):
+            amount = st.number_input("Requested Additional Monthly Amount", min_value=0.0, step=100000.0)
+            reason = st.text_input("Request Reason")
+            submitted = st.form_submit_button("Submit Monthly Request", type="primary")
+            if submitted:
+                try:
+                    create_monthly_budget_request(month, amount, reason, "Claims Manager", DB_PATH)
+                    st.success("Monthly additional budget request submitted.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(str(exc))
+
+    with tab_approval:
+        st.subheader("Finance Manager Approval Queue")
+        if requests.empty:
+            st.info("No budget requests for this month.")
+        else:
+            st.dataframe(requests, use_container_width=True, height=320)
+            pending = requests[requests["status"] == "PENDING"]
+            if pending.empty:
+                st.info("No pending requests.")
+            else:
+                selected_id = st.selectbox("Select Pending Request ID", pending["id"].astype(int).tolist())
+                remarks = st.text_input("Approval / Rejection Remarks")
+                col_a, col_b = st.columns(2)
+                if col_a.button("Approve Request", type="primary"):
+                    try:
+                        approve_monthly_budget_request(int(selected_id), "Finance Manager", remarks, DB_PATH)
+                        st.success("Monthly request approved and applied to weekly allocation.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+                if col_b.button("Reject Request"):
+                    try:
+                        reject_monthly_budget_request(int(selected_id), "Finance Manager", remarks, DB_PATH)
+                        st.warning("Monthly request rejected.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
 
 
 def main() -> None:
