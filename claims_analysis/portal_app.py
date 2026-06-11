@@ -63,13 +63,13 @@ HTML = """
     <nav class="nav">
       <button id="navHome" class="active" onclick="showHome()">Home <small>System overview and startup status</small></button>
       <button id="navDashboard" onclick="loadFrame('Dashboard','/dashboard','navDashboard')">Dashboard <small>Claims analysis HTML dashboard</small></button>
-      <button id="navPayment" data-role="Claims Manager,Admin" onclick="guardedLoad('Payment Scheduling','http://127.0.0.1:5050','navPayment')">Payment Scheduling <small>Claims Manager / Admin</small></button>
-      <button id="navBudget" data-role="Finance Manager,Admin" onclick="guardedLoad('Budget Management','http://127.0.0.1:5051','navBudget')">Budget Management <small>Finance Manager / Admin</small></button>
+      <button id="navPayment" data-role="Claims Manager,Admin" onclick="guardedLoad('Payment Scheduling',paymentUrl(),'navPayment')">Payment Scheduling <small>Claims Manager / Admin</small></button>
+      <button id="navBudget" data-role="Finance Manager,Admin" onclick="guardedLoad('Budget Management',budgetUrl(),'navBudget')">Budget Management <small>Finance Manager / Admin</small></button>
     </nav>
     <div class="status">
       <b>Startup:</b><br>
       <span class="code">python run_claims_portal.py</span><br><br>
-      Portal: 5049<br>Payment: 5050<br>Budget: 5051
+      Portal: <span id="portalHost">5049</span><br>Payment: <span id="paymentHost">5050</span><br>Budget: <span id="budgetHost">5051</span>
     </div>
   </aside>
   <section class="main">
@@ -90,7 +90,7 @@ HTML = """
           <div class="card"><h3>Payment Scheduling</h3><p>Claims Manager workflow for For Scheduling, Scheduled, category tabs, provider drilldown, and batch scheduling.</p></div>
           <div class="card"><h3>Budget Management</h3><p>Finance Manager workflow for monthly budget, fixed 4-week allocation, weekly reallocation, and approvals.</p></div>
         </div>
-        <div class="card" style="margin-top:14px"><h3>Recommended Startup</h3><p><span class="code">python run_claims_portal.py</span></p></div>
+        <div class="card" style="margin-top:14px"><h3>Recommended Startup</h3><p><span class="code">python run_claims_portal.py</span></p><p id="networkInfo" style="color:#64748b"></p></div>
       </div>
       <div id="framePanel" class="framecard" style="display:none"><iframe id="mainFrame" src="about:blank"></iframe></div>
     </div>
@@ -98,6 +98,10 @@ HTML = """
 </div>
 <script>
 let currentUrl='/';let currentUser='';let currentRole='';
+function baseHost(){return window.location.hostname || '127.0.0.1';}
+function paymentUrl(){return window.location.protocol + '//' + baseHost() + ':5050';}
+function budgetUrl(){return window.location.protocol + '//' + baseHost() + ':5051';}
+function setNetworkLabels(){document.getElementById('portalHost').textContent=baseHost()+':5049';document.getElementById('paymentHost').textContent=baseHost()+':5050';document.getElementById('budgetHost').textContent=baseHost()+':5051';document.getElementById('networkInfo').textContent='Current portal host: '+baseHost()+'. Embedded modules will use this same host.';}
 function setActive(id){['navHome','navDashboard','navPayment','navBudget'].forEach(x=>document.getElementById(x).classList.toggle('active',x===id));}
 function hasAccess(navId){const btn=document.getElementById(navId);const allowed=(btn.dataset.role||'').split(',').filter(Boolean);return allowed.length===0||allowed.includes(currentRole);}
 function applyAccess(){['navPayment','navBudget'].forEach(id=>document.getElementById(id).classList.toggle('locked',!hasAccess(id)));}
@@ -108,7 +112,7 @@ function showHome(){setActive('navHome');document.getElementById('pageTitle').te
 function guardedLoad(title,url,navId){if(!hasAccess(navId)){alert('Access restricted for '+currentRole+'.');return}loadFrame(title,url,navId);}
 function loadFrame(title,url,navId){setActive(navId);document.getElementById('pageTitle').textContent=title;document.getElementById('homePanel').style.display='none';document.getElementById('framePanel').style.display='block';document.getElementById('mainFrame').src=url;document.getElementById('openNew').href=url;currentUrl=url;}
 function refreshCurrent(){if(currentUrl==='/'){location.reload();return}document.getElementById('mainFrame').src=currentUrl;}
-restoreLogin();
+setNetworkLabels();restoreLogin();
 </script>
 </body>
 </html>
