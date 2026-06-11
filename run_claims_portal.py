@@ -8,17 +8,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
+HOST = "0.0.0.0"
+SERVER_URL = "http://192.168.2.13"
 
 APPS = [
-    ("Portal", [PYTHON, "-m", "claims_analysis.portal_app"], "http://127.0.0.1:5049"),
-    ("Payment Scheduling", [PYTHON, "-m", "claims_analysis.payment_app"], "http://127.0.0.1:5050"),
-    ("Budget Management", [PYTHON, "-m", "claims_analysis.budget_app"], "http://127.0.0.1:5051"),
+    ("Portal", [PYTHON, "-m", "claims_analysis.portal_app", "--host", HOST, "--port", "5049"], f"{SERVER_URL}:5049"),
+    ("Payment Scheduling", [PYTHON, "-m", "claims_analysis.payment_app", "--host", HOST, "--port", "5050"], f"{SERVER_URL}:5050"),
+    ("Budget Management", [PYTHON, "-m", "claims_analysis.budget_app", "--host", HOST, "--port", "5051"], f"{SERVER_URL}:5051"),
 ]
 
 
 def main() -> None:
     processes: list[tuple[str, subprocess.Popen]] = []
-    print("Starting Claims Analysis Portal environment...")
+    print("Starting Claims Analysis Portal environment in NETWORK MODE...")
     print("Press CTRL+C in this window to stop all apps.\n")
 
     try:
@@ -29,10 +31,11 @@ def main() -> None:
             time.sleep(1.2)
 
         print("\nAll apps started.")
-        print("Portal: http://127.0.0.1:5049")
-        print("Payment Scheduling: http://127.0.0.1:5050")
-        print("Budget Management: http://127.0.0.1:5051\n")
-        webbrowser.open("http://127.0.0.1:5049")
+        print(f"Portal: {SERVER_URL}:5049")
+        print(f"Payment Scheduling: {SERVER_URL}:5050")
+        print(f"Budget Management: {SERVER_URL}:5051\n")
+        print("Users should open the Portal URL in their browser.")
+        webbrowser.open(f"{SERVER_URL}:5049")
 
         while True:
             time.sleep(1)
