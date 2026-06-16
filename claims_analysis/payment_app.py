@@ -13,36 +13,64 @@ APP_TITLE = "Claims Payment Workflow"
 
 CATEGORY_SQL = """
 CASE
-  WHEN UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%PROFESSIONAL%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%PROF FEE%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%PROFESSIONAL FEE%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%PHYSICIAN%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '% DOCTOR%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE 'DR %'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '% DR %'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%M.D%'
-    THEN 'Professional'
-  WHEN UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%DENTAL%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%DENTIST%'
-    THEN 'Dental Clinic'
-  WHEN UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%CLINIC%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%DIAGNOSTIC%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%LABORATORY%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%IMAGING%'
-    OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%MEDICAL CENTER%'
-    THEN 'Medical Clinic'
-  ELSE 'Hospital'
+ WHEN UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%PROFESSIONAL%'
+   OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%PROF FEE%'
+   OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%PHYSICIAN%'
+   OR UPPER(COALESCE(provider,'')) LIKE 'DR %' THEN 'Professional'
+ WHEN UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%DENTAL%'
+   OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%DENTIST%' THEN 'Dental Clinic'
+ WHEN UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%CLINIC%'
+   OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%DIAGNOSTIC%'
+   OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%LABORATORY%'
+   OR UPPER(COALESCE(supplier_category_name,'') || ' ' || COALESCE(provider,'')) LIKE '%MEDICAL CENTER%' THEN 'Medical Clinic'
+ ELSE 'Hospital'
 END
 """
+AMOUNT_SQL = "CAST(COALESCE(NULLIF(expected_check_amount,''), NULLIF(claims_amount,''), '0') AS REAL)"
 
-VALID_CATEGORIES = {"Hospital", "Medical Clinic", "Dental Clinic", "Professional"}
 
-
-def _category_filter(args) -> tuple[str, list[str]]:
-    category = (args.get("category") or "Hospital").strip()
-    if category not in VALID_CATEGORIES:
-        category = "Hospital"
-    return f"AND ({CATEGORY_SQL}) = ?", [category]
+def _where(args, scheduled: bool) -> tuple[str, list[object]]:
+    clauses = ["UPPER(COALESCE(payment_status,'')) = 'UNPAID'"]
+    clauses.append("COALESCE(target_payment_date,'') <> ''" if scheduled else "COALESCE(target_payment_date,'') = ''")
+    params: list[object] = []
+    q = (args.get("q") or "").strip()
+    if q:
+        clauses.append("(provider LIKE ? OR batch_no LIKE ? OR region LIKE ? OR credit_term LIKE ? OR cv_no LIKE ? OR check_no LIKE ?)")
+        params.extend([f"%{q}%"] * 6)
+    category = (args.get("category") or "All").strip()
+    if category and category != "All":
+        clauses.append(f"({CATEGORY_SQL}) = ?")
+        params.append(category)
+    for field, column in [("region", "region"), ("aging", "aging_bucket"), ("priority", "payment_priority"), ("approval", "approval_status")]:
+        value = (args.get(field) or "").strip()
+        if value:
+            clauses.append(f"COALESCE({column},'') LIKE ?")
+            params.append(f"%{value}%")
+    date_from = (args.get("date_from") or "").strip()
+    if date_from:
+        clauses.append("date_received >= ?")
+        params.append(date_from)
+    date_to = (args.get("date_to") or "").strip()
+    if date_to:
+        clauses.append("date_received <= ?")
+        params.append(date_to)
+    target_from = (args.get("target_from") or "").strip()
+    if scheduled and target_from:
+        clauses.append("target_payment_date >= ?")
+        params.append(target_from)
+    target_to = (args.get("target_to") or "").strip()
+    if scheduled and target_to:
+        clauses.append("target_payment_date <= ?")
+        params.append(target_to)
+    amount_min = (args.get("amount_min") or "").strip()
+    if amount_min:
+        clauses.append(f"{AMOUNT_SQL} >= ?")
+        params.append(float(amount_min))
+    amount_max = (args.get("amount_max") or "").strip()
+    if amount_max:
+        clauses.append(f"{AMOUNT_SQL} <= ?")
+        params.append(float(amount_max))
+    return " AND ".join(clauses), params
 
 
 def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
@@ -51,165 +79,57 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
 
     @app.get("/")
     def index():
-        return DASHBOARD_HTML
+        return HTML
 
-    @app.get("/api/metrics")
-    def api_metrics():
+    @app.get("/api/summary")
+    def api_summary():
+        scheduled = request.args.get("mode") == "scheduled"
+        where, params = _where(request.args, scheduled)
         with connect(db_path) as conn:
-            row = conn.execute(
-                """
-                SELECT
-                    SUM(CASE WHEN UPPER(COALESCE(payment_status,'')) = 'UNPAID' AND COALESCE(target_payment_date,'') = '' THEN 1 ELSE 0 END) AS for_scheduling_count,
-                    SUM(CASE WHEN UPPER(COALESCE(payment_status,'')) = 'UNPAID' AND COALESCE(target_payment_date,'') <> '' THEN 1 ELSE 0 END) AS scheduled_count,
-                    SUM(CASE WHEN UPPER(COALESCE(payment_status,'')) = 'UNPAID' AND COALESCE(target_payment_date,'') = '' THEN CAST(COALESCE(NULLIF(expected_check_amount,''),'0') AS REAL) ELSE 0 END) AS for_scheduling_amount,
-                    SUM(CASE WHEN UPPER(COALESCE(payment_status,'')) = 'UNPAID' AND COALESCE(target_payment_date,'') <> '' THEN CAST(COALESCE(NULLIF(expected_check_amount,''),'0') AS REAL) ELSE 0 END) AS scheduled_amount
-                FROM payment_tags
-                """
-            ).fetchone()
-        return jsonify(dict(row))
+            total = conn.execute(f"SELECT COUNT(*) AS count, SUM({AMOUNT_SQL}) AS amount FROM payment_tags WHERE {where}", params).fetchone()
+            by_category = conn.execute(f"SELECT ({CATEGORY_SQL}) AS label, COUNT(*) AS count, SUM({AMOUNT_SQL}) AS amount FROM payment_tags WHERE {where} GROUP BY label ORDER BY amount DESC", params).fetchall()
+            by_region = conn.execute(f"SELECT COALESCE(NULLIF(region,''),'No Region') AS label, COUNT(*) AS count, SUM({AMOUNT_SQL}) AS amount FROM payment_tags WHERE {where} GROUP BY label ORDER BY amount DESC LIMIT 12", params).fetchall()
+            by_aging = conn.execute(f"SELECT COALESCE(NULLIF(aging_bucket,''),'No Aging') AS label, COUNT(*) AS count, SUM({AMOUNT_SQL}) AS amount FROM payment_tags WHERE {where} GROUP BY label ORDER BY amount DESC", params).fetchall()
+        return jsonify({"total": dict(total), "category": [dict(r) for r in by_category], "region": [dict(r) for r in by_region], "aging": [dict(r) for r in by_aging]})
 
-    @app.get("/api/providers")
-    def api_providers():
-        q = (request.args.get("q") or "").strip()
-        category_sql, category_params = _category_filter(request.args)
-        provider_filter = ""
-        params: list[str] = []
-        if q:
-            provider_filter = "AND provider LIKE ?"
-            params.append(f"%{q}%")
-        params.extend(category_params)
+    @app.get("/api/batches")
+    def api_batches():
+        scheduled = request.args.get("mode") == "scheduled"
+        where, params = _where(request.args, scheduled)
+        order = "target_payment_date ASC, provider ASC, date_received ASC" if scheduled else "provider ASC, date_received ASC"
         with connect(db_path) as conn:
-            rows = conn.execute(
-                f"""
-                SELECT provider, region, credit_term, ({CATEGORY_SQL}) AS provider_category,
-                       COUNT(*) AS batch_count,
-                       SUM(CAST(COALESCE(NULLIF(expected_check_amount,''),'0') AS REAL)) AS amount
-                FROM payment_tags
-                WHERE UPPER(COALESCE(payment_status,'')) = 'UNPAID'
-                  AND COALESCE(target_payment_date,'') = ''
-                  AND COALESCE(provider, '') <> ''
-                  {provider_filter}
-                  {category_sql}
-                GROUP BY provider, region, credit_term, provider_category
-                ORDER BY amount DESC, batch_count DESC, provider ASC
-                LIMIT 300
-                """,
-                params,
-            ).fetchall()
-        return jsonify([dict(row) for row in rows])
-
-    @app.get("/api/provider-batches")
-    def api_provider_batches():
-        provider = (request.args.get("provider") or "").strip()
-        if not provider:
-            return jsonify({"error": "Provider is required"}), 400
-        category_sql, category_params = _category_filter(request.args)
-        with connect(db_path) as conn:
-            rows = conn.execute(
-                f"""
-                SELECT batch_no, provider, supplier_category_name, ({CATEGORY_SQL}) AS provider_category,
-                       region, date_received, aging_bucket, credit_term,
-                       expected_check_amount, claims_amount, payment_priority,
-                       tagged_for_payment, target_payment_date, approval_status, payment_remarks,
+            rows = conn.execute(f"""
+                SELECT batch_no, provider, ({CATEGORY_SQL}) AS category, region, date_received,
+                       aging_bucket, credit_term, {AMOUNT_SQL} AS amount,
+                       target_payment_date, payment_priority, approval_status, payment_remarks,
                        cv_no, check_no, check_date
                 FROM payment_tags
-                WHERE provider = ?
-                  AND UPPER(COALESCE(payment_status,'')) = 'UNPAID'
-                  AND COALESCE(target_payment_date,'') = ''
-                  {category_sql}
-                ORDER BY CASE
-                            WHEN aging_bucket LIKE '%ABOVE 120%' THEN 1
-                            WHEN aging_bucket LIKE '%91-120%' THEN 2
-                            WHEN aging_bucket LIKE '%61-90%' THEN 3
-                            WHEN aging_bucket LIKE '%31-60%' THEN 4
-                            ELSE 5
-                         END,
-                         date_received ASC,
-                         CAST(COALESCE(NULLIF(expected_check_amount,''),'0') AS REAL) DESC
-                """,
-                [provider, *category_params],
-            ).fetchall()
-        return jsonify([dict(row) for row in rows])
-
-    @app.get("/api/scheduled-providers")
-    def api_scheduled_providers():
-        q = (request.args.get("q") or "").strip()
-        category_sql, category_params = _category_filter(request.args)
-        provider_filter = ""
-        params: list[str] = []
-        if q:
-            provider_filter = "AND provider LIKE ?"
-            params.append(f"%{q}%")
-        params.extend(category_params)
-        with connect(db_path) as conn:
-            rows = conn.execute(
-                f"""
-                SELECT provider, region, credit_term, ({CATEGORY_SQL}) AS provider_category,
-                       COUNT(*) AS batch_count,
-                       SUM(CAST(COALESCE(NULLIF(expected_check_amount,''),'0') AS REAL)) AS amount,
-                       MIN(target_payment_date) AS earliest_payment_date,
-                       MAX(target_payment_date) AS latest_payment_date
-                FROM payment_tags
-                WHERE UPPER(COALESCE(payment_status,'')) = 'UNPAID'
-                  AND COALESCE(target_payment_date,'') <> ''
-                  AND COALESCE(provider, '') <> ''
-                  {provider_filter}
-                  {category_sql}
-                GROUP BY provider, region, credit_term, provider_category
-                ORDER BY earliest_payment_date ASC, amount DESC, provider ASC
-                LIMIT 300
-                """,
-                params,
-            ).fetchall()
-        return jsonify([dict(row) for row in rows])
-
-    @app.get("/api/scheduled-provider-batches")
-    def api_scheduled_provider_batches():
-        provider = (request.args.get("provider") or "").strip()
-        if not provider:
-            return jsonify({"error": "Provider is required"}), 400
-        category_sql, category_params = _category_filter(request.args)
-        with connect(db_path) as conn:
-            rows = conn.execute(
-                f"""
-                SELECT batch_no, provider, supplier_category_name, ({CATEGORY_SQL}) AS provider_category,
-                       region, date_received, aging_bucket, credit_term,
-                       expected_check_amount, claims_amount, payment_priority,
-                       tagged_for_payment, target_payment_date, approval_status, payment_remarks,
-                       tagged_date, cv_no, check_no, check_date
-                FROM payment_tags
-                WHERE provider = ?
-                  AND UPPER(COALESCE(payment_status,'')) = 'UNPAID'
-                  AND COALESCE(target_payment_date,'') <> ''
-                  {category_sql}
-                ORDER BY target_payment_date ASC, batch_no ASC
-                """,
-                [provider, *category_params],
-            ).fetchall()
-        return jsonify([dict(row) for row in rows])
+                WHERE {where}
+                ORDER BY {order}
+                LIMIT 1500
+            """, params).fetchall()
+        return jsonify([dict(r) for r in rows])
 
     @app.post("/api/schedule-selected")
     def api_schedule_selected():
         payload = request.get_json(force=True, silent=True) or {}
         batch_numbers = [str(x).strip() for x in payload.get("batch_numbers", []) if str(x).strip()]
-        if not batch_numbers:
-            return jsonify({"error": "No batches selected"}), 400
-        target_payment_date = str(payload.get("target_payment_date", "") or "").strip()
-        if not target_payment_date:
-            return jsonify({"error": "Target payment date is required"}), 400
-        update_values = {
+        target_date = str(payload.get("target_payment_date") or "").strip()
+        if not batch_numbers or not target_date:
+            return jsonify({"error": "Select batches and target payment date."}), 400
+        placeholders = ",".join(["?"] * len(batch_numbers))
+        with connect(db_path) as conn:
+            rows = conn.execute(f"SELECT batch_no, provider FROM payment_tags WHERE batch_no IN ({placeholders})", batch_numbers).fetchall()
+        values = {
             "tagged_for_payment": "YES",
-            "target_payment_date": target_payment_date,
-            "payment_priority": payload.get("payment_priority", "HIGH"),
+            "target_payment_date": target_date,
+            "payment_priority": payload.get("payment_priority", "NORMAL"),
             "approval_status": payload.get("approval_status", ""),
             "payment_remarks": payload.get("payment_remarks", ""),
             "tagged_date": datetime.now().strftime("%Y-%m-%d"),
         }
-        placeholders = ",".join(["?"] * len(batch_numbers))
-        with connect(db_path) as conn:
-            rows = conn.execute(f"SELECT batch_no, provider FROM payment_tags WHERE batch_no IN ({placeholders})", batch_numbers).fetchall()
         for row in rows:
-            upsert_tag(row["batch_no"], {**update_values, "provider": row["provider"]}, db_path=db_path, actor="selected_batch_schedule")
+            upsert_tag(row["batch_no"], {**values, "provider": row["provider"]}, db_path=db_path, actor="payment_filters")
         return jsonify({"updated_rows": len(rows)})
 
     @app.post("/api/unschedule-selected")
@@ -217,17 +137,12 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
         payload = request.get_json(force=True, silent=True) or {}
         batch_numbers = [str(x).strip() for x in payload.get("batch_numbers", []) if str(x).strip()]
         if not batch_numbers:
-            return jsonify({"error": "No batches selected"}), 400
+            return jsonify({"error": "Select batches."}), 400
         placeholders = ",".join(["?"] * len(batch_numbers))
         with connect(db_path) as conn:
             rows = conn.execute(f"SELECT batch_no, provider FROM payment_tags WHERE batch_no IN ({placeholders})", batch_numbers).fetchall()
         for row in rows:
-            upsert_tag(
-                row["batch_no"],
-                {"provider": row["provider"], "tagged_for_payment": "", "target_payment_date": "", "payment_priority": "", "approval_status": "", "payment_remarks": ""},
-                db_path=db_path,
-                actor="unschedule_selected",
-            )
+            upsert_tag(row["batch_no"], {"provider": row["provider"], "tagged_for_payment": "", "target_payment_date": "", "payment_priority": "", "approval_status": "", "payment_remarks": ""}, db_path=db_path, actor="payment_filters")
         return jsonify({"updated_rows": len(rows)})
 
     @app.get("/export/payments.csv")
@@ -235,8 +150,7 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
         rows = get_all_tags(db_path)
         output = io.StringIO()
         if rows:
-            fieldnames = list(rows[0].keys())
-            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
             writer.writeheader()
             writer.writerows(rows)
         return Response(output.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=payments_db_export.csv"})
@@ -244,52 +158,37 @@ def create_app(db_path: str | Path = DEFAULT_DB_PATH) -> Flask:
     return app
 
 
-DASHBOARD_HTML = """
-<!doctype html><html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Claims Payment Workflow</title>
-<style>
-:root{--bg:#f3f6fb;--card:#fff;--text:#172033;--muted:#64748b;--border:#dbe3ef;--primary:#1d4ed8;--primary2:#2563eb;--good:#047857;--danger:#b91c1c;--warning:#b45309;--accent:#eef2ff;--dark:#0f172a;--soft:#f8fafc;--shadow:0 10px 25px rgba(15,23,42,.08)}*{box-sizing:border-box}body{margin:0;font-family:Arial,Helvetica,sans-serif;background:linear-gradient(180deg,#eef4ff 0,#f8fafc 280px,#f3f6fb 100%);color:var(--text)}header{background:linear-gradient(135deg,#0f172a,#1e3a8a);color:#fff;padding:24px 30px 28px;border-bottom:1px solid rgba(255,255,255,.12)}header h1{margin:0 0 8px;font-size:28px;letter-spacing:-.3px}header p{margin:0;color:#dbeafe;font-size:13px}.header-row{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}.badge{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:8px 12px;font-size:12px;font-weight:800;color:white}main{padding:18px;max-width:1600px;margin:0 auto}.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:16px;box-shadow:var(--shadow);margin-bottom:16px}.card h3{margin:0 0 12px;font-size:18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.metric-card{background:linear-gradient(180deg,#fff,#f8fafc);border:1px solid var(--border);border-radius:18px;padding:16px;box-shadow:0 4px 14px rgba(15,23,42,.05)}.metric-label{color:var(--muted);font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;margin-bottom:7px}.metric-value{font-size:24px;font-weight:900;letter-spacing:-.4px}.tabs,.view-tabs,.category-tabs{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:14px}.tab,.view-tab,.category-tab{border:1px solid var(--border);background:white;border-radius:999px;padding:10px 14px;cursor:pointer;font-weight:900;transition:.15s}.tab:hover,.view-tab:hover,.category-tab:hover,button:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(15,23,42,.12)}.tab.active,.view-tab.active,.category-tab.active{background:var(--primary);border-color:var(--primary);color:white}.search-row{display:grid;grid-template-columns:minmax(240px,1fr) auto;gap:12px;align-items:end}.schedule-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:12px;align-items:end}label{display:block;color:var(--muted);font-size:12px;font-weight:800;margin-bottom:5px}input,select{width:100%;padding:10px 11px;border:1px solid var(--border);border-radius:11px;background:white;font-family:inherit;font-size:12px;outline:none}input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(29,78,216,.12)}button{border:1px solid var(--border);background:white;padding:10px 12px;border-radius:11px;cursor:pointer;font-weight:800;font-size:12px;transition:.15s}button.primary{background:var(--primary);color:white;border-color:var(--primary)}button.good{background:var(--good);color:white;border-color:var(--good)}button.danger{color:var(--danger);border-color:#fecaca;background:#fff7f7}.note{color:var(--muted);font-size:12px}.module{display:none}.module.active{display:block}.treasury-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-top:12px}.summary-card{background:linear-gradient(180deg,#fff,#f8fafc);border:1px solid var(--border);border-radius:14px;padding:12px;min-height:78px}.summary-label{color:var(--muted);font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}.summary-value{font-size:18px;font-weight:900;overflow-wrap:anywhere}.split{display:grid;grid-template-columns:390px minmax(0,1fr);gap:14px;margin-top:14px}.panel-title{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}.provider-list{max-height:590px;overflow:auto;border:1px solid var(--border);border-radius:16px;background:#fff}.provider-item{width:100%;text-align:left;border:0;border-bottom:1px solid var(--border);border-radius:0;background:#fff;padding:12px;font-weight:400;transition:.15s}.provider-item:hover{background:#f8fafc;transform:none;box-shadow:none}.provider-item.active{background:#dbeafe;border-left:5px solid var(--primary)}.table-wrap{overflow:auto;max-height:590px;border:1px solid var(--border);border-radius:16px;background:white}.data-table{border-collapse:collapse;width:100%;min-width:1080px;font-size:11px;table-layout:fixed}.data-table th,.data-table td{border-bottom:1px solid var(--border);padding:9px 10px;text-align:left;vertical-align:top;white-space:normal;overflow-wrap:anywhere;line-height:1.25}.data-table th{position:sticky;top:0;background:#f8fafc;z-index:1;color:#334155;font-size:10px;text-transform:uppercase;letter-spacing:.04em}.data-table tr:hover td{background:#f8fafc}.col-money{text-align:right}.action-row{display:flex;gap:10px;justify-content:space-between;align-items:center;margin-top:14px;flex-wrap:wrap}.calendar{display:grid;grid-template-columns:repeat(7,minmax(125px,1fr));gap:10px;padding:10px}.day{background:white;border:1px solid var(--border);border-radius:14px;min-height:130px;padding:10px;box-shadow:0 3px 10px rgba(15,23,42,.05)}.day-head{font-size:11px;color:var(--muted);font-weight:900;margin-bottom:6px}.day-total{font-size:12px;font-weight:900;margin-bottom:6px}.event{background:var(--accent);border:1px solid #c7d2fe;border-radius:10px;padding:7px;margin-top:6px;font-size:11px}.modal-backdrop{display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:1000;align-items:center;justify-content:center;padding:18px}.modal-backdrop.active{display:flex}.modal{width:min(760px,100%);background:#fff;border-radius:18px;box-shadow:0 25px 60px rgba(15,23,42,.35);border:1px solid var(--border);overflow:hidden}.modal-header{padding:18px 20px;background:linear-gradient(135deg,#0f172a,#1e3a8a);color:white}.modal-header h3{margin:0;font-size:19px}.modal-body{padding:18px}.modal-footer{padding:14px 18px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}.selected-pill{display:inline-block;background:#eef2ff;color:#3730a3;border-radius:999px;padding:7px 11px;font-weight:900}.help-box{background:#eff6ff;border:1px solid #bfdbfe;border-radius:12px;padding:11px;margin-top:12px;color:#1e40af;font-size:12px}.toast{display:none;position:fixed;right:18px;bottom:18px;background:#0f172a;color:white;border-radius:14px;padding:12px 14px;box-shadow:0 14px 32px rgba(15,23,42,.25);z-index:2000;font-weight:800}.toast.show{display:block}@media(max-width:1000px){main{padding:12px}.split{grid-template-columns:1fr}.search-row{grid-template-columns:1fr}.calendar{grid-template-columns:1fr}.header-row{display:block}.badge{display:inline-block;margin-top:12px}}
-</style></head><body>
-<header><div class="header-row"><div><h1>Claims Payment Workflow</h1><p>Provider drilldown, batch selection, payment scheduling, and calendar/list review.</p></div><div class="badge">Unpaid → Scheduled workflow</div></div></header><main>
-<section class="grid" id="metrics"></section>
-<div class="tabs"><button id="tabForScheduling" class="tab active" onclick="setModule('forScheduling')">For Scheduling</button><button id="tabScheduled" class="tab" onclick="setModule('scheduled')">Scheduled</button></div>
-<section id="forSchedulingModule" class="module active card"><h3>For Scheduling</h3><div id="forCategoryTabs" class="category-tabs"></div><div class="search-row"><div><label>Search Provider</label><input id="providerSearch" placeholder="Type provider name..." /></div><div><button class="primary" onclick="loadProviders()">Refresh Providers</button></div></div><div id="selectionSummary" class="note" style="margin-top:10px">Select a provider to view unscheduled unpaid batches.</div><div id="treasurySummary" class="treasury-grid"></div><div class="split"><div><div class="panel-title"><span class="note">Providers with unscheduled unpaid batches</span></div><div id="providerList" class="provider-list"></div></div><div><div class="panel-title"><span class="note">Unscheduled unpaid batches under selected provider</span></div><div id="providerBatchWrap" class="table-wrap"></div></div></div><div class="action-row"><div><span id="selectedActionText" class="selected-pill">0 selected</span></div><div><button class="danger" onclick="clearSelection()">Clear Selection</button><button class="good" onclick="openScheduleModal()">Schedule Checked Batches</button><button onclick="window.location.href='/export/payments.csv'">Export DB CSV</button></div></div></section>
-<section id="scheduledModule" class="module card"><h3>Scheduled</h3><div id="scheduledCategoryTabs" class="category-tabs"></div><div class="search-row"><div><label>Search Scheduled Provider</label><input id="scheduledProviderSearch" placeholder="Type provider name..." /></div><div><button class="primary" onclick="loadScheduledProviders()">Refresh Scheduled Providers</button></div></div><div id="scheduledSummary" class="note" style="margin-top:10px">Select a scheduled provider to view scheduled batches.</div><div id="scheduledTreasurySummary" class="treasury-grid"></div><div class="split"><div><div class="panel-title"><span class="note">Providers with scheduled batches</span></div><div id="scheduledProviderList" class="provider-list"></div></div><div><div class="view-tabs"><button id="calendarViewBtn" class="view-tab active" onclick="setScheduledView('calendar')">Calendar View</button><button id="listViewBtn" class="view-tab" onclick="setScheduledView('list')">Drilldown List View</button></div><div id="scheduledBatchWrap" class="table-wrap"></div></div></div><div class="action-row"><div><span id="scheduledSelectedText" class="selected-pill">0 selected</span></div><div><button class="danger" onclick="unscheduleChecked()">Return Checked to For Scheduling</button><button onclick="window.location.href='/export/payments.csv'">Export DB CSV</button></div></div></section>
-</main><div id="scheduleModal" class="modal-backdrop"><div class="modal"><div class="modal-header"><h3>Schedule Selected Batches</h3></div><div class="modal-body"><div id="modalSummary" class="note" style="margin-bottom:12px">0 batches selected.</div><div class="schedule-grid"><div><label>Target Payment Date <b style="color:#b91c1c">*</b></label><input id="targetPaymentDate" type="date" /></div><div><label>Priority</label><select id="paymentPriority"><option value="HIGH">HIGH</option><option value="URGENT">URGENT</option><option value="NORMAL">NORMAL</option><option value="LOW">LOW</option></select></div><div><label>Approval</label><select id="approvalStatus"><option value="">No Approval Yet</option><option value="APPROVED">APPROVED</option><option value="HOLD">HOLD</option></select></div><div><label>Remarks</label><input id="paymentRemarks" placeholder="Payment batch remarks" /></div></div><div class="help-box">Final save will move checked batches from For Scheduling to Scheduled.</div></div><div class="modal-footer"><button onclick="closeScheduleModal()">Cancel</button><button class="good" onclick="confirmScheduleCheckedBatches()">Confirm Save Schedule</button></div></div></div><div id="toast" class="toast"></div>
+HTML = """
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Claims Payment Workflow</title><style>
+body{margin:0;font-family:Arial,Helvetica,sans-serif;background:#f3f6fb;color:#172033}header{background:linear-gradient(135deg,#0f172a,#1e3a8a);color:white;padding:22px 28px}h1{margin:0 0 6px}main{padding:16px;max-width:1700px;margin:0 auto}.card{background:white;border:1px solid #dbe3ef;border-radius:14px;padding:14px;margin-bottom:14px;box-shadow:0 2px 8px rgba(15,23,42,.08)}.tabs,.chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}button{border:1px solid #dbe3ef;border-radius:9px;background:white;padding:9px 12px;font-weight:800;cursor:pointer}.active,.primary{background:#1d4ed8!important;color:white!important}.good{background:#047857;color:white}.danger{color:#b91c1c;border-color:#fecaca}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.metric{background:#f8fafc;border:1px solid #dbe3ef;border-radius:12px;padding:12px}.metric b{display:block;font-size:11px;color:#64748b;text-transform:uppercase;margin-bottom:6px}.metric span{font-size:19px;font-weight:900}.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px;align-items:end}label{display:block;font-size:12px;color:#64748b;font-weight:800;margin-bottom:5px}input,select{width:100%;padding:9px;border:1px solid #dbe3ef;border-radius:9px}.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px}.bar{margin:9px 0}.bar-label{display:flex;justify-content:space-between;font-size:12px;font-weight:800}.bar-track{height:14px;background:#e2e8f0;border-radius:999px;overflow:hidden}.bar-fill{height:100%;background:linear-gradient(90deg,#1d4ed8,#60a5fa)}.wrap{overflow:auto;max-height:620px;border:1px solid #dbe3ef;border-radius:12px}.tbl{border-collapse:collapse;width:100%;min-width:1250px;font-size:12px}.tbl th,.tbl td{border-bottom:1px solid #dbe3ef;padding:8px;vertical-align:top;white-space:normal;overflow-wrap:anywhere}.tbl th{background:#f8fafc;position:sticky;top:0;z-index:1;text-align:left}.num{text-align:right}.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:end}.pill{display:inline-block;background:#eef2ff;color:#3730a3;border-radius:999px;padding:7px 10px;font-weight:900}.modal{display:none;position:fixed;inset:0;background:rgba(15,23,42,.55);align-items:center;justify-content:center;padding:18px}.modal.show{display:flex}.box{background:white;border-radius:16px;max-width:780px;width:100%;overflow:hidden}.box h3{background:#0f172a;color:white;margin:0;padding:16px}.box-body{padding:16px}.box-foot{padding:14px;border-top:1px solid #dbe3ef;text-align:right}.toast{display:none;position:fixed;right:18px;bottom:18px;background:#0f172a;color:white;border-radius:14px;padding:12px 14px;font-weight:800}.toast.show{display:block}
+</style></head><body><header><h1>Claims Payment Workflow</h1><div>Filter unpaid batches, view amount graphs, and schedule selected batches.</div></header><main>
+<section class="card"><div class="tabs"><button id="btnUnscheduled" class="active" onclick="setMode('unscheduled')">For Scheduling</button><button id="btnScheduled" onclick="setMode('scheduled')">Scheduled</button></div><div class="chips" id="catChips"></div><div class="filters"><div><label>Global Search</label><input id="q" placeholder="Provider, batch, CV, check, region"></div><div><label>Region</label><input id="region"></div><div><label>Aging</label><input id="aging" placeholder="Above 120, 61-90"></div><div><label>Date Received From</label><input id="date_from" type="date"></div><div><label>Date Received To</label><input id="date_to" type="date"></div><div><label>Amount Min</label><input id="amount_min" type="number"></div><div><label>Amount Max</label><input id="amount_max" type="number"></div><div id="targetFromBox"><label>Payment From</label><input id="target_from" type="date"></div><div id="targetToBox"><label>Payment To</label><input id="target_to" type="date"></div><button class="primary" onclick="loadAll()">Apply Filters</button></div></section>
+<section class="grid" id="metrics"></section><section class="charts" id="charts"></section>
+<section class="card"><div class="actions"><span id="selectedText" class="pill">0 selected</span><button class="good" onclick="openSchedule()" id="scheduleBtn">Schedule Selected</button><button class="danger" onclick="unschedule()" id="unscheduleBtn">Return Selected to For Scheduling</button><button onclick="location.href='/export/payments.csv'">Export DB CSV</button></div><br><div class="wrap" id="tableWrap"></div></section></main>
+<div class="modal" id="modal"><div class="box"><h3>Schedule Selected Batches</h3><div class="box-body"><div class="filters"><div><label>Target Payment Date</label><input id="targetPaymentDate" type="date"></div><div><label>Priority</label><select id="priority"><option>NORMAL</option><option>HIGH</option><option>URGENT</option><option>LOW</option></select></div><div><label>Approval</label><select id="approval"><option></option><option>APPROVED</option><option>HOLD</option></select></div><div><label>Remarks</label><input id="remarks"></div></div></div><div class="box-foot"><button onclick="closeSchedule()">Cancel</button><button class="good" onclick="schedule()">Confirm Schedule</button></div></div></div><div id="toast" class="toast"></div>
 <script>
-let selectedProvider='';let providerBatches=[];let scheduledProvider='';let scheduledBatches=[];let scheduledView='calendar';let providerTimer=null;let scheduledProviderTimer=null;let forCategory='Hospital';let scheduledCategory='Hospital';const CATS=['Hospital','Medical Clinic','Dental Clinic','Professional'];
-function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2600)}
-function num(v){const n=Number(String(v??'').replaceAll(',',''));return Number.isNaN(n)?0:n}function money(v){return 'PHP '+num(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}function escapeHtml(v){return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;')}function upper(v){return String(v??'').trim().toUpperCase()}function checkedBatchNumbers(){return[...document.querySelectorAll('.batch-check:checked')].map(x=>x.value)}function checkedScheduledNumbers(){return[...document.querySelectorAll('.scheduled-check:checked')].map(x=>x.value)}function agingRank(v){const a=upper(v);if(a.includes('ABOVE 120'))return 5;if(a.includes('91-120')||a.includes('90-120'))return 4;if(a.includes('61-90')||a.includes('60-90'))return 3;if(a.includes('31-60')||a.includes('30-60'))return 2;if(a.includes('0-30'))return 1;return 0}
-function renderCategoryTabs(){document.getElementById('forCategoryTabs').innerHTML=CATS.map(c=>`<button class="category-tab ${c===forCategory?'active':''}" onclick="setForCategory('${c}')">${c}</button>`).join('');document.getElementById('scheduledCategoryTabs').innerHTML=CATS.map(c=>`<button class="category-tab ${c===scheduledCategory?'active':''}" onclick="setScheduledCategory('${c}')">${c}</button>`).join('')}
-function setForCategory(c){forCategory=c;selectedProvider='';providerBatches=[];renderCategoryTabs();document.getElementById('providerBatchWrap').innerHTML='';loadProviders();updateSelectionSummary()}
-function setScheduledCategory(c){scheduledCategory=c;scheduledProvider='';scheduledBatches=[];renderCategoryTabs();document.getElementById('scheduledBatchWrap').innerHTML='';loadScheduledProviders();updateScheduledSelection()}
-function setModule(moduleName){document.getElementById('forSchedulingModule').classList.toggle('active',moduleName==='forScheduling');document.getElementById('scheduledModule').classList.toggle('active',moduleName==='scheduled');document.getElementById('tabForScheduling').classList.toggle('active',moduleName==='forScheduling');document.getElementById('tabScheduled').classList.toggle('active',moduleName==='scheduled');if(moduleName==='scheduled')loadScheduledProviders();else loadProviders();loadMetrics()}
-async function loadMetrics(){const res=await fetch('/api/metrics');const m=await res.json();const items=[['For Scheduling',Number(m.for_scheduling_count||0).toLocaleString()],['Scheduled',Number(m.scheduled_count||0).toLocaleString()],['For Scheduling Amount',money(m.for_scheduling_amount||0)],['Scheduled Amount',money(m.scheduled_amount||0)]];document.getElementById('metrics').innerHTML=items.map(([l,v])=>`<div class="metric-card"><div class="metric-label">${l}</div><div class="metric-value">${v}</div></div>`).join('')}
-async function loadProviders(){const q=document.getElementById('providerSearch').value||'';const res=await fetch('/api/providers?q='+encodeURIComponent(q)+'&category='+encodeURIComponent(forCategory));const rows=await res.json();document.getElementById('providerList').innerHTML=rows.map(r=>`<button class="provider-item ${r.provider===selectedProvider?'active':''}" onclick="selectProvider('${escapeHtml(r.provider)}')"><b>${escapeHtml(r.provider)}</b><br><span class="note">${escapeHtml(r.provider_category||forCategory)} | ${escapeHtml(r.region||'')} | ${escapeHtml(r.credit_term||'')}<br>${Number(r.batch_count||0).toLocaleString()} batches | ${money(r.amount||0)}</span></button>`).join('')||`<div style="padding:12px" class="note">No ${forCategory} providers for scheduling.</div>`}
-async function selectProvider(provider){selectedProvider=provider;await loadProviders();const res=await fetch('/api/provider-batches?provider='+encodeURIComponent(provider)+'&category='+encodeURIComponent(forCategory));providerBatches=await res.json();renderProviderBatches();clearScheduleInputs()}
-function rowsStats(rows,selected){const set=new Set(selected);const totalAmount=rows.reduce((a,r)=>a+num(r.expected_check_amount),0);const selectedAmount=rows.filter(r=>set.has(String(r.batch_no))).reduce((a,r)=>a+num(r.expected_check_amount),0);const dates=rows.map(r=>String(r.date_received||'')).filter(Boolean).sort();const highest=rows.reduce((best,r)=>agingRank(r.aging_bucket)>agingRank(best)?r.aging_bucket:best,'');const credit=[...new Set(rows.map(r=>r.credit_term).filter(Boolean))].join(', ');return{totalBatches:rows.length,totalAmount,selectedCount:selected.length,selectedAmount,remainingCount:rows.length-selected.length,remainingAmount:totalAmount-selectedAmount,oldestDate:dates[0]||'',highestAging:highest||'',creditTerm:credit||''}}
-function renderSummary(targetId,stats,label){const items=[[`${label} Amount`,money(stats.totalAmount)],[`${label} Batches`,stats.totalBatches.toLocaleString()],['Selected Amount',money(stats.selectedAmount)],['Selected Batches',stats.selectedCount.toLocaleString()],['Remaining After Selection',money(stats.remainingAmount)],['Remaining Batch Count',stats.remainingCount.toLocaleString()],['Oldest Received',stats.oldestDate||'-'],['Highest Aging',stats.highestAging||'-'],['Credit Term',stats.creditTerm||'-']];document.getElementById(targetId).innerHTML=items.map(([l,v])=>`<div class="summary-card"><div class="summary-label">${escapeHtml(l)}</div><div class="summary-value">${escapeHtml(v)}</div></div>`).join('')}
-function updateSelectionSummary(){const s=rowsStats(providerBatches,checkedBatchNumbers());document.getElementById('selectionSummary').textContent=`Category: ${forCategory} | Selected Provider: ${selectedProvider||'None'} | Selected Batches: ${s.selectedCount.toLocaleString()} | Selected Amount: ${money(s.selectedAmount)}`;document.getElementById('selectedActionText').textContent=`${s.selectedCount.toLocaleString()} selected | ${money(s.selectedAmount)}`;renderSummary('treasurySummary',s,'Unscheduled')}
-function renderProviderBatches(){if(!providerBatches.length){document.getElementById('providerBatchWrap').innerHTML=`<div style="padding:14px" class="note">No unscheduled ${forCategory} batches found.</div>`;updateSelectionSummary();return}const header=`<thead><tr><th style="width:42px"><input type="checkbox" onchange="toggleAllBatches(this.checked)" /></th><th>Batch No</th><th>Category</th><th>Date Received</th><th>Aging</th><th>Credit Term</th><th>Expected Check</th><th>CV No</th><th>Check No</th></tr></thead>`;const body=`<tbody>${providerBatches.map(r=>`<tr><td><input class="batch-check" type="checkbox" value="${escapeHtml(r.batch_no)}" onchange="updateSelectionSummary()" /></td><td>${escapeHtml(r.batch_no)}</td><td>${escapeHtml(r.provider_category||r.supplier_category_name||'')}</td><td>${escapeHtml(r.date_received)}</td><td>${escapeHtml(r.aging_bucket)}</td><td>${escapeHtml(r.credit_term)}</td><td class="col-money">${money(r.expected_check_amount)}</td><td>${escapeHtml(r.cv_no||'')}</td><td>${escapeHtml(r.check_no||'')}</td></tr>`).join('')}</tbody>`;document.getElementById('providerBatchWrap').innerHTML=`<table class="data-table">${header}${body}</table>`;updateSelectionSummary()}
-function toggleAllBatches(checked){document.querySelectorAll('.batch-check').forEach(x=>x.checked=checked);updateSelectionSummary()}function clearSelection(){document.querySelectorAll('.batch-check').forEach(x=>x.checked=false);updateSelectionSummary();clearScheduleInputs()}function clearScheduleInputs(){document.getElementById('targetPaymentDate').value='';document.getElementById('paymentPriority').value='HIGH';document.getElementById('approvalStatus').value='';document.getElementById('paymentRemarks').value=''}
-function openScheduleModal(){const s=rowsStats(providerBatches,checkedBatchNumbers());if(!s.selectedCount){alert('Select at least one batch first.');return}document.getElementById('modalSummary').textContent=`${s.selectedCount.toLocaleString()} checked ${forCategory} batches | Selected Amount: ${money(s.selectedAmount)} | Provider: ${selectedProvider}`;document.getElementById('scheduleModal').classList.add('active');document.getElementById('targetPaymentDate').focus()}function closeScheduleModal(){document.getElementById('scheduleModal').classList.remove('active')}
-async function confirmScheduleCheckedBatches(){const batch_numbers=checkedBatchNumbers();if(!batch_numbers.length){alert('Select at least one batch.');closeScheduleModal();return}if(!document.getElementById('targetPaymentDate').value){alert('Set the target payment date first.');document.getElementById('targetPaymentDate').focus();return}if(!confirm(`Final save: move ${batch_numbers.length.toLocaleString()} checked batches to Scheduled?`))return;const payload={batch_numbers,target_payment_date:document.getElementById('targetPaymentDate').value,payment_priority:document.getElementById('paymentPriority').value,approval_status:document.getElementById('approvalStatus').value,payment_remarks:document.getElementById('paymentRemarks').value};const res=await fetch('/api/schedule-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});const data=await res.json();if(data.error){alert(data.error);return}showToast(`Moved ${Number(data.updated_rows||0).toLocaleString()} checked batches to Scheduled.`);closeScheduleModal();await selectProvider(selectedProvider);await loadScheduledProviders();await loadMetrics()}
-async function loadScheduledProviders(){const q=document.getElementById('scheduledProviderSearch').value||'';const res=await fetch('/api/scheduled-providers?q='+encodeURIComponent(q)+'&category='+encodeURIComponent(scheduledCategory));const rows=await res.json();document.getElementById('scheduledProviderList').innerHTML=rows.map(r=>`<button class="provider-item ${r.provider===scheduledProvider?'active':''}" onclick="selectScheduledProvider('${escapeHtml(r.provider)}')"><b>${escapeHtml(r.provider)}</b><br><span class="note">${escapeHtml(r.provider_category||scheduledCategory)} | ${escapeHtml(r.region||'')} | ${escapeHtml(r.credit_term||'')}<br>${Number(r.batch_count||0).toLocaleString()} batches | ${money(r.amount||0)}<br>Payment: ${escapeHtml(r.earliest_payment_date||'')} to ${escapeHtml(r.latest_payment_date||'')}</span></button>`).join('')||`<div style="padding:12px" class="note">No scheduled ${scheduledCategory} providers.</div>`}
-async function selectScheduledProvider(provider){scheduledProvider=provider;await loadScheduledProviders();const res=await fetch('/api/scheduled-provider-batches?provider='+encodeURIComponent(provider)+'&category='+encodeURIComponent(scheduledCategory));scheduledBatches=await res.json();scheduledView='calendar';renderScheduledBatches()}
-function setScheduledView(view){scheduledView=view;document.getElementById('calendarViewBtn').classList.toggle('active',view==='calendar');document.getElementById('listViewBtn').classList.toggle('active',view==='list');renderScheduledBatches()}
-function updateScheduledSelection(){const s=rowsStats(scheduledBatches,checkedScheduledNumbers());document.getElementById('scheduledSummary').textContent=`Category: ${scheduledCategory} | Selected Provider: ${scheduledProvider||'None'} | Scheduled Batches: ${s.totalBatches.toLocaleString()} | Scheduled Amount: ${money(s.totalAmount)} | Selected: ${s.selectedCount.toLocaleString()} / ${money(s.selectedAmount)}`;document.getElementById('scheduledSelectedText').textContent=`${s.selectedCount.toLocaleString()} selected | ${money(s.selectedAmount)}`;renderSummary('scheduledTreasurySummary',s,'Scheduled')}
-function renderScheduledBatches(){if(!scheduledBatches.length){document.getElementById('scheduledBatchWrap').innerHTML=`<div style="padding:14px" class="note">No scheduled ${scheduledCategory} batches found.</div>`;updateScheduledSelection();return}if(scheduledView==='calendar'){renderScheduledCalendar();return}renderScheduledList()}
-function renderScheduledCalendar(){const grouped={};scheduledBatches.forEach(r=>{const d=r.target_payment_date||'No Date';if(!grouped[d])grouped[d]=[];grouped[d].push(r)});const days=Object.keys(grouped).sort();document.getElementById('scheduledBatchWrap').innerHTML=`<div class="calendar">${days.map(d=>{const rows=grouped[d];const amount=rows.reduce((a,r)=>a+num(r.expected_check_amount),0);return `<div class="day"><div class="day-head">${escapeHtml(d)}</div><div class="day-total">${rows.length.toLocaleString()} batches<br>${money(amount)}</div>${rows.slice(0,8).map(r=>`<div class="event"><label><input class="scheduled-check" type="checkbox" value="${escapeHtml(r.batch_no)}" onchange="updateScheduledSelection()" /> ${escapeHtml(r.batch_no)}</label><br>${money(r.expected_check_amount)} | ${escapeHtml(r.payment_priority||'')}</div>`).join('')}${rows.length>8?`<div class="note">+${rows.length-8} more in list view</div>`:''}</div>`}).join('')}</div>`;updateScheduledSelection()}
-function renderScheduledList(){const header=`<thead><tr><th style="width:42px"><input type="checkbox" onchange="toggleAllScheduled(this.checked)" /></th><th>Target Payment</th><th>Batch No</th><th>Category</th><th>Date Received</th><th>Aging</th><th>Expected Check</th><th>Priority</th><th>Approval</th><th>Remarks</th></tr></thead>`;const body=`<tbody>${scheduledBatches.map(r=>`<tr><td><input class="scheduled-check" type="checkbox" value="${escapeHtml(r.batch_no)}" onchange="updateScheduledSelection()" /></td><td>${escapeHtml(r.target_payment_date)}</td><td>${escapeHtml(r.batch_no)}</td><td>${escapeHtml(r.provider_category||r.supplier_category_name||'')}</td><td>${escapeHtml(r.date_received)}</td><td>${escapeHtml(r.aging_bucket)}</td><td class="col-money">${money(r.expected_check_amount)}</td><td>${escapeHtml(r.payment_priority)}</td><td>${escapeHtml(r.approval_status)}</td><td>${escapeHtml(r.payment_remarks)}</td></tr>`).join('')}</tbody>`;document.getElementById('scheduledBatchWrap').innerHTML=`<table class="data-table">${header}${body}</table>`;updateScheduledSelection()}
-function toggleAllScheduled(checked){document.querySelectorAll('.scheduled-check').forEach(x=>x.checked=checked);updateScheduledSelection()}
-async function unscheduleChecked(){const batch_numbers=checkedScheduledNumbers();if(!batch_numbers.length){alert('Select at least one scheduled batch.');return}if(!confirm(`Return ${batch_numbers.length.toLocaleString()} selected batches to For Scheduling?`))return;const res=await fetch('/api/unschedule-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batch_numbers})});const data=await res.json();if(data.error){alert(data.error);return}showToast(`Returned ${Number(data.updated_rows||0).toLocaleString()} batches to For Scheduling.`);await selectScheduledProvider(scheduledProvider);await loadProviders();await loadMetrics()}
-document.getElementById('providerSearch').addEventListener('input',()=>{clearTimeout(providerTimer);providerTimer=setTimeout(loadProviders,300)});document.getElementById('scheduledProviderSearch').addEventListener('input',()=>{clearTimeout(scheduledProviderTimer);scheduledProviderTimer=setTimeout(loadScheduledProviders,300)});document.getElementById('scheduleModal').addEventListener('click',e=>{if(e.target.id==='scheduleModal')closeScheduleModal()});renderCategoryTabs();loadMetrics();loadProviders();
+let mode='unscheduled', category='All', rows=[]; const CATS=['All','Hospital','Medical Clinic','Dental Clinic','Professional'];
+function peso(v){return 'PHP '+Number(v||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}function esc(v){return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')}function checked(){return [...document.querySelectorAll('.chk:checked')].map(x=>x.value)}function toastMsg(m){toast.textContent=m;toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),2500)}
+function renderCats(){catChips.innerHTML=CATS.map(c=>'<button class="'+(c===category?'active':'')+'" onclick="category=\''+c+'\';renderCats();loadAll()">'+c+'</button>').join('')}
+function params(){let p=new URLSearchParams({mode:mode,category:category});['q','region','aging','date_from','date_to','amount_min','amount_max','target_from','target_to'].forEach(id=>{let v=document.getElementById(id).value;if(v)p.set(id,v)});return p.toString()}
+function setMode(m){mode=m;btnUnscheduled.classList.toggle('active',m==='unscheduled');btnScheduled.classList.toggle('active',m==='scheduled');targetFromBox.style.display=m==='scheduled'?'block':'none';targetToBox.style.display=m==='scheduled'?'block':'none';scheduleBtn.style.display=m==='unscheduled'?'inline-block':'none';unscheduleBtn.style.display=m==='scheduled'?'inline-block':'none';loadAll()}
+async function loadAll(){let s=await (await fetch('/api/summary?'+params())).json();rows=await (await fetch('/api/batches?'+params())).json();renderSummary(s);renderCharts(s);renderTable();updateSelected()}
+function renderSummary(s){metrics.innerHTML=[['Batches',s.total.count||0],['Amount',peso(s.total.amount||0)],['Category',category],['Mode',mode]].map(x=>'<div class="metric"><b>'+x[0]+'</b><span>'+x[1]+'</span></div>').join('')}
+function chartBlock(title,data){let max=Math.max(...data.map(x=>Number(x.amount||0)),1);return '<div class="card"><h3>'+title+'</h3>'+data.map(r=>'<div class="bar"><div class="bar-label"><span>'+esc(r.label)+'</span><span>'+peso(r.amount||0)+'</span></div><div class="bar-track"><div class="bar-fill" style="width:'+(Number(r.amount||0)/max*100)+'%"></div></div></div>').join('')+'</div>'}
+function renderCharts(s){charts.innerHTML=chartBlock('Amount by Category',s.category||[])+chartBlock('Amount by Region',s.region||[])+chartBlock('Amount by Aging',s.aging||[])}
+function renderTable(){if(!rows.length){tableWrap.innerHTML='<div style="padding:14px;color:#64748b">No records found.</div>';return}let head='<thead><tr><th><input type="checkbox" onchange="document.querySelectorAll(\'.chk\').forEach(c=>c.checked=this.checked);updateSelected()"></th><th>Batch</th><th>Provider</th><th>Category</th><th>Region</th><th>Date Received</th><th>Aging</th><th>Credit</th><th class="num">Amount</th><th>Target Payment</th><th>Priority</th><th>CV</th><th>Check</th></tr></thead>';let body='<tbody>'+rows.map(r=>'<tr><td><input class="chk" type="checkbox" onchange="updateSelected()" value="'+esc(r.batch_no)+'"></td><td>'+esc(r.batch_no)+'</td><td>'+esc(r.provider)+'</td><td>'+esc(r.category)+'</td><td>'+esc(r.region)+'</td><td>'+esc(r.date_received)+'</td><td>'+esc(r.aging_bucket)+'</td><td>'+esc(r.credit_term)+'</td><td class="num">'+peso(r.amount)+'</td><td>'+esc(r.target_payment_date)+'</td><td>'+esc(r.payment_priority)+'</td><td>'+esc(r.cv_no)+'</td><td>'+esc(r.check_no)+'</td></tr>').join('')+'</tbody>';tableWrap.innerHTML='<table class="tbl">'+head+body+'</table>'}
+function updateSelected(){let ids=checked();let amt=rows.filter(r=>ids.includes(String(r.batch_no))).reduce((a,r)=>a+Number(r.amount||0),0);selectedText.textContent=ids.length.toLocaleString()+' selected | '+peso(amt)}
+function openSchedule(){if(!checked().length){alert('Select batches first.');return}modal.classList.add('show')}function closeSchedule(){modal.classList.remove('show')}
+async function schedule(){let ids=checked();if(!targetPaymentDate.value){alert('Target payment date is required.');return}let res=await fetch('/api/schedule-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batch_numbers:ids,target_payment_date:targetPaymentDate.value,payment_priority:priority.value,approval_status:approval.value,payment_remarks:remarks.value})});let out=await res.json();if(!res.ok){alert(out.error);return}closeSchedule();toastMsg('Scheduled '+out.updated_rows+' batches.');loadAll()}
+async function unschedule(){let ids=checked();if(!ids.length){alert('Select scheduled batches first.');return}let res=await fetch('/api/unschedule-selected',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batch_numbers:ids})});let out=await res.json();if(!res.ok){alert(out.error);return}toastMsg('Returned '+out.updated_rows+' batches.');loadAll()}
+['q','region','aging'].forEach(id=>document.getElementById(id).addEventListener('input',()=>{clearTimeout(window.t);window.t=setTimeout(loadAll,400)}));renderCats();setMode('unscheduled');
 </script></body></html>
 """
 
 
 def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="Run local database-backed claims payment workflow app.")
+    parser = argparse.ArgumentParser(description="Run claims payment workflow app.")
     parser.add_argument("--db", default=DEFAULT_DB_PATH)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5050)
