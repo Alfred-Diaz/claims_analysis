@@ -95,10 +95,60 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
+def _migrate_budget_weeks_unique_constraint(conn: sqlite3.Connection) -> None:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='budget_weeks'").fetchone()
+    if not row or not row["sql"]:
+        return
+    sql = row["sql"].replace("\n", " ").replace("  ", " ").upper()
+    if "UNIQUE(BUDGET_MONTH, POOL_CODE, WEEK_NO)" in sql or "UNIQUE (BUDGET_MONTH, POOL_CODE, WEEK_NO)" in sql:
+        return
+
+    conn.execute("ALTER TABLE budget_weeks RENAME TO budget_weeks_old")
+    conn.execute(
+        """
+        CREATE TABLE budget_weeks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            budget_month TEXT NOT NULL,
+            pool_code TEXT DEFAULT 'MEDICAL',
+            week_no INTEGER NOT NULL,
+            week_start TEXT NOT NULL,
+            week_end TEXT NOT NULL,
+            allocated_budget REAL DEFAULT 0,
+            used_budget REAL DEFAULT 0,
+            remaining_budget REAL DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(budget_month, pool_code, week_no)
+        )
+        """
+    )
+    old_cols = {row["name"] for row in conn.execute("PRAGMA table_info(budget_weeks_old)").fetchall()}
+    pool_expr = "COALESCE(NULLIF(pool_code,''),'MEDICAL')" if "pool_code" in old_cols else "'MEDICAL'"
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO budget_weeks
+        (budget_month, pool_code, week_no, week_start, week_end, allocated_budget, used_budget, remaining_budget, created_at, updated_at)
+        SELECT budget_month,
+               {pool_expr},
+               week_no,
+               week_start,
+               week_end,
+               allocated_budget,
+               used_budget,
+               remaining_budget,
+               COALESCE(created_at, CURRENT_TIMESTAMP),
+               COALESCE(updated_at, CURRENT_TIMESTAMP)
+        FROM budget_weeks_old
+        """
+    )
+    conn.execute("DROP TABLE budget_weeks_old")
+
+
 def init_budget_db(db_path: str | Path = DEFAULT_DB_PATH) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
         _ensure_column(conn, "budget_weeks", "pool_code", "pool_code TEXT DEFAULT 'MEDICAL'")
+        _migrate_budget_weeks_unique_constraint(conn)
         _ensure_column(conn, "weekly_budget_adjustments", "pool_code", "pool_code TEXT DEFAULT 'MEDICAL'")
         _ensure_column(conn, "monthly_budget_requests", "pool_code", "pool_code TEXT DEFAULT 'MEDICAL'")
         conn.commit()
